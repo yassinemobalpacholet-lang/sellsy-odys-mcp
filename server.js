@@ -246,16 +246,20 @@ async function handleMCPMessage(message) {
         // Support both Odys structure and direct structure
         let client_email, client_name, items, subject;
 
-        // Check if args has job.client structure (Odys format)
+        // Check if args has job structure (Odys format)
         if (args.job && args.job.client) {
           const jobClient = args.job.client;
+          const jobRows = args.job.rows || [];
+
           client_email = jobClient.email;
           client_name = `${jobClient.prenom} ${jobClient.nom}`;
           subject = jobClient.subject || `Devis ${jobClient.nom}`;
-          items = (jobClient.rows || []).map(row => ({
+
+          // Map rows to items (rows can be at job.rows or job.client.rows)
+          items = jobRows.map(row => ({
             description: row.nom || row.name || 'Article',
-            quantity: row.qte || row.quantity || 1,
-            unit_price: parseFloat(row.pu || row.unit_price || 0)
+            quantity: parseInt(row.qte) || row.quantity || 1,
+            unit_price: parseFloat(row.pu) || row.unit_price || 0
           }));
         } else {
           // Direct parameter structure
@@ -390,4 +394,3 @@ app.listen(PORT, () => {
 });
 
 export default app;
-
