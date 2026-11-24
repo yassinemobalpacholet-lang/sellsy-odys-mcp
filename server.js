@@ -383,7 +383,7 @@ app.get('/', (req, res) => {
 
 // === SERVER ===
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Sellsy-Odys MCP connector running on port ${PORT}`);
   console.log(`📍 MCP endpoint: http://localhost:${PORT}/mcp/${ODYS_KEY}`);
 });
