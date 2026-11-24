@@ -13,6 +13,7 @@ let tokenCache = {
   expires_at: 0
 };
 
+// Logging helper
 function log(message, data = '') {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] ${message}`, data);
@@ -20,6 +21,7 @@ function log(message, data = '') {
 
 app.use(express.json());
 
+// MCP Protocol Implementation
 const tools = [
   {
     name: 'create_estimate',
@@ -52,6 +54,7 @@ const tools = [
   }
 ];
 
+// Get Sellsy OAuth2 Token
 async function getSellsyToken() {
   log('Checking token cache...');
 
@@ -101,6 +104,7 @@ async function getSellsyToken() {
   }
 }
 
+// Call Sellsy API
 async function callSellsyAPI(method, endpoint, data = null) {
   log(`Calling Sellsy API: ${method} ${endpoint}`);
 
@@ -129,10 +133,12 @@ async function callSellsyAPI(method, endpoint, data = null) {
   return await response.json();
 }
 
+// Find or Create Client
 async function findOrCreateClient(email, name) {
   log('Looking for client:', email);
 
   try {
+    // Search for existing client
     const searchResponse = await callSellsyAPI('GET', `/contacts?search=${encodeURIComponent(email)}`);
 
     if (searchResponse.data && searchResponse.data.length > 0) {
@@ -142,6 +148,7 @@ async function findOrCreateClient(email, name) {
 
     log('Creating new client:', name);
 
+    // Create new client
     const createResponse = await callSellsyAPI('POST', '/contacts', {
       firstname: name.split(' ')[0],
       lastname: name.split(' ').slice(1).join(' ') || name,
@@ -156,10 +163,13 @@ async function findOrCreateClient(email, name) {
   }
 }
 
+// Create Estimate
 async function createEstimate(clientId, subject, items) {
   log('Creating estimate for client:', clientId);
 
   try {
+    const totalHT = items.reduce((sum, item) => sum + (item.quantity * item.unit_price), 0);
+
     const estimateData = {
       client_id: clientId,
       subject: subject,
@@ -180,6 +190,7 @@ async function createEstimate(clientId, subject, items) {
   }
 }
 
+// MCP Message Handler
 async function handleMCPMessage(message) {
   log('Handling MCP message:', message.method);
 
@@ -207,27 +218,14 @@ async function handleMCPMessage(message) {
     log('Calling tool:', name);
 
     if (name === 'ping') {
-      try {
-        await callSellsyAPI('GET', '/contacts');
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Connection to Sellsy successful!'
-            }
-          ]
-        };
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Connection failed: ${error.message}`
-            }
-          ],
-          isError: true
-        };
-      }
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'Sellsy-Odys-MCP server is running!'
+          }
+        ]
+      };
     }
 
     if (name === 'create_estimate') {
@@ -272,6 +270,7 @@ async function handleMCPMessage(message) {
   return { error: 'Unknown method' };
 }
 
+// Routes
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -320,6 +319,7 @@ app.get('/', (req, res) => {
   });
 });
 
+// Start Server
 app.listen(PORT, () => {
   log('='.repeat(60));
   log('Sellsy-Odys-MCP Server Started');
@@ -329,7 +329,7 @@ app.listen(PORT, () => {
   log('MCP Key configured:', ODYS_KEY ? 'YES' : 'NO');
   log('Sellsy ID configured:', SELLSY_ID !== 'default-id' ? 'YES' : 'NO');
   log('Sellsy Secret configured:', SELLSY_SECRET !== 'default-secret' ? 'YES' : 'NO');
-  log('OAuth2 Endpoint:', 'https://login.sellsy.com/oauth2/access-tokens');
+  log('OAuth2 Endpoint:', 'https://oauth.sellsy.com/oauth2/token');
   log('='.repeat(60));
 });
 
