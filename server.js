@@ -2,58 +2,114 @@ import express from 'express';
 import fetch from 'node-fetch';
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 8080;
 
 const SELLSY_ID = process.env.SELLSY_ID || 'default-id';
 const SELLSY_SECRET = process.env.SELLSY_SECRET || 'default-secret';
 const ODYS_KEY = process.env.ODYS_KEY || 'default-key';
-const PORT = process.env.PORT || 8080;
 
 let tokenCache = {
   access_token: null,
   expires_at: 0
 };
 
-console.log(`✅ Sellsy-Odys MCP Server Starting...`);
-console.log(`📍 Configuration:`);
-console.log(`   - SELLSY_ID: ${SELLSY_ID ? SELLSY_ID.substring(0, 8) + '...' : 'NOT SET'}`);
-console.log(`   - SELLSY_SECRET: ${SELLSY_SECRET ? 'SET' : 'NOT SET'}`);
-console.log(`   - ODYS_KEY: ${ODYS_KEY}`);
-console.log(`   - PORT: ${PORT}`);
+// Logging helper
+function log(message, data = '') {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${message}`, data);
+}
 
+app.use(express.json());
+
+// MCP Protocol Implementation
+const tools = [
+  {
+    name: 'create_estimate',
+    description: 'Create an estimate (devis) in Sellsy CRM',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_email: { type: 'string', description: 'Email of the client' },
+        client_name: { type: 'string', description: 'Name of the client' },
+        items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              description: { type: 'string' },
+              quantity: { type: 'number' },
+              unit_price: { type: 'number' }
+            }
+          },
+          description: 'Line items for the estimate'
+        },
+        subject: { type: 'string', description: 'Subject/title of the estimate' }
+      },
+      required: ['client_email', 'client_name', 'items', 'subject']
+    }
+  },
+  {
+    name: 'ping',
+    description: 'Test connection to Sellsy'
+  }
+];
+
+// Get Sellsy OAuth2 Token
 async function getSellsyToken() {
+  log('Checking token cache...');
+  
   if (tokenCache.access_token && Date.now() < tokenCache.expires_at) {
+    log('Using cached token, expires in', Math.round((tokenCache.expires_at - Date.now()) / 1000) + 's');
     return tokenCache.access_token;
   }
 
-  const tokenUrl = 'https://api.sellsy.com/oauth2/access_token';
-  const response = await fetch(tokenUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded'
-    },
-    body: new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: SELLSY_ID,
-      client_secret: SELLSY_SECRET
-    })
-  });
+  log('Requesting new token from Sellsy OAuth2');
+  log('Using credentials:', `ID=${SELLSY_ID.substring(0, 8)}...`);
 
-  if (!response.ok) {
-    throw new Error(`Sellsy token error: ${response.status} ${response.statusText}`);
+  const tokenUrl = 'https://oauth.sellsy.com/oauth2/token';
+  
+  try {
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: SELLSY_ID,
+        client_secret: SELLSY_SECRET
+      }).toString()
+    });
+
+    log('Token response status:', response.status);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      log('Token error response:', errorText.substring(0, 500));
+      throw new Error(`Sellsy token error: ${response.status} ${response.statusText} - ${errorText.substring(0, 200)}`);
+    }
+
+    const data = await response.json();
+    log('Token obtained successfully, expires in', data.expires_in + 's');
+    
+    tokenCache = {
+      access_token: data.access_token,
+      expires_at: Date.now() + (data.expires_in || 3600) * 1000
+    };
+
+    return data.access_token;
+  } catch (error) {
+    log('ERROR in getSellsyToken:', error.message);
+    throw error;
   }
-
-  const data = await response.json();
-  tokenCache = {
-    access_token: data.access_token,
-    expires_at: Date.now() + (data.expires_in || 3600) * 1000
-  };
-  return data.access_token;
 }
 
-async function callSellsyAPI(method, endpoint, body = null) {
+// Call Sellsy API
+async function callSellsyAPI(method, endpoint, data = null) {
+  log(`Calling Sellsy API: ${method} ${endpoint}`);
+  
   const token = await getSellsyToken();
-  const url = `https://api.sellsy.com/v2${endpoint}`;
+  
   const options = {
     method,
     headers: {
@@ -61,221 +117,234 @@ async function callSellsyAPI(method, endpoint, body = null) {
       'Content-Type': 'application/json'
     }
   };
-  if (body) {
-    options.body = JSON.stringify(body);
+
+  if (data) {
+    options.body = JSON.stringify(data);
   }
-  const response = await fetch(url, options);
+
+  const response = await fetch(`https://api.sellsy.com/v2${endpoint}`, options);
+
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Sellsy API error: ${response.status} - ${errorText}`);
+    log(`API error ${response.status}:`, errorText.substring(0, 500));
+    throw new Error(`Sellsy API error: ${response.status} - ${errorText.substring(0, 200)}`);
   }
+
   return await response.json();
 }
 
+// Find or Create Client
 async function findOrCreateClient(email, name) {
+  log('Looking for client:', email);
+  
   try {
-    const searchResponse = await callSellsyAPI('GET', `/contacts?email=${encodeURIComponent(email)}`);
+    // Search for existing client
+    const searchResponse = await callSellsyAPI('GET', `/contacts?search=${encodeURIComponent(email)}`);
+    
     if (searchResponse.data && searchResponse.data.length > 0) {
+      log('Found existing client:', searchResponse.data[0].id);
       return searchResponse.data[0].id;
     }
+
+    log('Creating new client:', name);
+    
+    // Create new client
     const createResponse = await callSellsyAPI('POST', '/contacts', {
-      email,
-      name,
-      type: 'person'
+      firstname: name.split(' ')[0],
+      lastname: name.split(' ').slice(1).join(' ') || name,
+      email: email
     });
+
+    log('Client created with ID:', createResponse.data.id);
     return createResponse.data.id;
   } catch (error) {
-    console.error('Client management error:', error);
+    log('ERROR in findOrCreateClient:', error.message);
     throw error;
   }
 }
 
-async function createEstimate(clientId, items, subject) {
+// Create Estimate
+async function createEstimate(clientId, subject, items) {
+  log('Creating estimate for client:', clientId);
+  
   try {
+    const totalHT = items.reduce((sum, item) => sum + (item.quantity * item.unit_price), 0);
+    
     const estimateData = {
-      contact_id: clientId,
+      client_id: clientId,
+      subject: subject,
       status: 'draft',
-      subject: subject || 'Devis depuis Odys',
-      lines: items.map(item => ({
+      items: items.map(item => ({
         description: item.description,
-        quantity: item.quantity || 1,
-        unit_price: item.unit_price || 0,
-        tax_rate: item.tax_rate || 0.2
+        quantity: item.quantity,
+        unit_price: item.unit_price
       }))
     };
+
     const response = await callSellsyAPI('POST', '/estimates', estimateData);
+    log('Estimate created with ID:', response.data.id);
     return response.data;
   } catch (error) {
-    console.error('Estimate creation error:', error);
+    log('ERROR in createEstimate:', error.message);
     throw error;
   }
 }
 
-const MCP_TOOLS = [
-  {
-    name: 'create_estimate',
-    description: 'Create an estimate (devis) in Sellsy from an Odys request',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        client_email: { type: 'string', description: 'Client email address' },
-        client_name: { type: 'string', description: 'Client full name' },
-        items: {
-          type: 'array',
-          description: 'Line items for the estimate',
-          items: {
-            type: 'object',
-            properties: {
-              description: { type: 'string' },
-              quantity: { type: 'number' },
-              unit_price: { type: 'number' },
-              tax_rate: { type: 'number' }
-            }
-          }
-        },
-        subject: { type: 'string', description: 'Estimate subject/title' }
-      },
-      required: ['client_email', 'client_name', 'items']
-    }
-  },
-  {
-    name: 'ping',
-    description: 'Test endpoint - returns a pong response',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        message: { type: 'string', description: 'Message to echo back' }
-      }
-    }
-  }
-];
-
+// MCP Message Handler
 async function handleMCPMessage(message) {
-  console.log('📨 MCP Message received:', message.method);
+  log('Handling MCP message:', message.method);
+  
+  const { method, params } = message;
 
-  if (message.method === 'initialize') {
+  if (method === 'initialize') {
     return {
-      jsonrpc: '2.0',
-      id: message.id,
-      result: {
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: {} },
-        serverInfo: {
-          name: 'Sellsy-Odys MCP',
-          version: '1.0.0'
-        }
+      protocolVersion: '2024-11-05',
+      capabilities: {
+        tools: {}
+      },
+      serverInfo: {
+        name: 'Sellsy-Odys-MCP',
+        version: '1.0.0'
       }
     };
   }
 
-  if (message.method === 'tools/list') {
-    return {
-      jsonrpc: '2.0',
-      id: message.id,
-      result: { tools: MCP_TOOLS }
-    };
+  if (method === 'tools/list') {
+    return { tools };
   }
 
-  if (message.method === 'tools/call') {
-    const { name, arguments: args } = message.params;
-    try {
-      let result;
-      if (name === 'create_estimate') {
-        const clientId = await findOrCreateClient(args.client_email, args.client_name);
-        result = await createEstimate(clientId, args.items, args.subject);
-      } else if (name === 'ping') {
-        result = {
-          status: 'pong',
-          message: args.message || 'No message provided',
-          timestamp: new Date().toISOString()
+  if (method === 'tools/call') {
+    const { name, arguments: args } = params;
+    log('Calling tool:', name);
+
+    if (name === 'ping') {
+      try {
+        await callSellsyAPI('GET', '/account');
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Connection to Sellsy successful!'
+            }
+          ]
         };
-      } else {
-        throw new Error(`Unknown tool: ${name}`);
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Connection failed: ${error.message}`
+            }
+          ],
+          isError: true
+        };
       }
-      return {
-        jsonrpc: '2.0',
-        id: message.id,
-        result
-      };
-    } catch (error) {
-      return {
-        jsonrpc: '2.0',
-        id: message.id,
-        error: {
-          code: -32603,
-          message: error.message
-        }
-      };
     }
+
+    if (name === 'create_estimate') {
+      try {
+        const { client_email, client_name, items, subject } = args;
+        const clientId = await findOrCreateClient(client_email, client_name);
+        const estimate = await createEstimate(clientId, subject, items);
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Estimate created successfully! ID: ${estimate.id}`
+            }
+          ]
+        };
+      } catch (error) {
+        log('ERROR in create_estimate tool:', error.message);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error creating estimate: ${error.message}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Unknown tool: ${name}`
+        }
+      ],
+      isError: true
+    };
   }
 
-  return {
-    jsonrpc: '2.0',
-    id: message.id,
-    error: {
-      code: -32601,
-      message: 'Method not found'
-    }
-  };
+  return { error: 'Unknown method' };
 }
 
+// Routes
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 app.post('/mcp/:key', async (req, res) => {
   const { key } = req.params;
+  
   if (key !== ODYS_KEY) {
+    log('Unauthorized MCP request with invalid key');
     return res.status(401).json({ error: 'Unauthorized' });
   }
+
   try {
-    const message = req.body;
-    const response = await handleMCPMessage(message);
-    res.json(response);
+    const result = await handleMCPMessage(req.body);
+    res.json(result);
   } catch (error) {
-    console.error('MCP Error:', error);
+    log('ERROR in /mcp handler:', error.message);
     res.status(500).json({
       jsonrpc: '2.0',
       error: {
         code: -32603,
-        message: 'Internal server error: ' + error.message
-      }
+        message: error.message
+      },
+      id: req.body.id
     });
   }
 });
 
 app.get('/mcp/info', (req, res) => {
   res.json({
-    name: 'Sellsy-Odys MCP',
+    service: 'Sellsy-Odys-MCP',
     version: '1.0.0',
-    description: 'MCP server for integrating Sellsy CRM with Odys workflow management',
-    tools: MCP_TOOLS.map(t => ({ name: t.name, description: t.description }))
+    status: 'active'
   });
 });
 
 app.get('/', (req, res) => {
   res.json({
-    message: 'Sellsy-Odys MCP Server',
+    service: 'Sellsy-Odys-MCP',
     version: '1.0.0',
-    endpoints: {
-      health: 'GET /health',
-      mcp_info: 'GET /mcp/info',
-      mcp: 'POST /mcp/:key'
-    }
+    endpoints: [
+      'GET /health - Health check',
+      'POST /mcp/:key - MCP protocol',
+      'GET /mcp/info - Service info'
+    ]
   });
 });
 
-app.use((err, req, res, next) => {
-  console.error('Express Error:', err);
-  res.status(500).json({
-    error: 'Internal server error',
-    message: err.message
-  });
+// Start Server
+app.listen(PORT, () => {
+  log('='.repeat(60));
+  log('Sellsy-Odys-MCP Server Started');
+  log('='.repeat(60));
+  log('Port:', PORT);
+  log('Service URL:', `http://localhost:${PORT}`);
+  log('MCP Key configured:', ODYS_KEY ? 'YES' : 'NO');
+  log('Sellsy ID configured:', SELLSY_ID !== 'default-id' ? 'YES' : 'NO');
+  log('Sellsy Secret configured:', SELLSY_SECRET !== 'default-secret' ? 'YES' : 'NO');
+  log('OAuth2 Endpoint:', 'https://oauth.sellsy.com/oauth2/token');
+  log('='.repeat(60));
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Sellsy-Odys MCP Server running on port ${PORT}`);
-  console.log(`📍 MCP Endpoint: http://localhost:${PORT}/mcp/${ODYS_KEY}`);
-  console.log(`📍 Health: http://localhost:${PORT}/health`);
-  console.log(`📍 Info: http://localhost:${PORT}/mcp/info`);
-});
+export default app;
+
