@@ -58,7 +58,7 @@ const tools = [
 async function getSellsyToken() {
   log('Checking token cache...');
   
-  if (tokenCache.access_token && Date.now() < tokenCache.expires_at) {
+const tokenUrl = 'https://login.sellsy.com/oauth2/access-tokens';
     log('Using cached token, expires in', Math.round((tokenCache.expires_at - Date.now()) / 1000) + 's');
     return tokenCache.access_token;
   }
@@ -342,8 +342,7 @@ app.listen(PORT, () => {
   log('MCP Key configured:', ODYS_KEY ? 'YES' : 'NO');
   log('Sellsy ID configured:', SELLSY_ID !== 'default-id' ? 'YES' : 'NO');
   log('Sellsy Secret configured:', SELLSY_SECRET !== 'default-secret' ? 'YES' : 'NO');
-  log('OAuth2 Endpoint:', 'https://oauth.sellsy.com/oauth2/token');
-  log('='.repeat(60));
+  log('OAuth2 Endpoint:', 'https://login.sellsy.com/oauth2/access-tokens');
 });
 
 export default app;
