@@ -208,7 +208,7 @@ async function handleMCPMessage(message) {
 
     if (name === 'ping') {
       try {
-        await callSellsyAPI('GET', '/account');
+        await callSellsyAPI('GET', '/contacts');
         return {
           content: [
             {
