@@ -1,25 +1,17 @@
 {
   "name": "sellsy-odys-mcp",
   "version": "1.0.0",
-  "type": "module",
-  "description": "Sellsy-Odys MCP Connector - Node.js Express server",
+  "description": "MCP server for Sellsy-Odys integration",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "dependencies": {
     "express": "^4.18.2"
   },
-  "keywords": [
-    "mcp",
-    "sellsy",
-    "odys",
-    "connector"
-  ],
-  "author": "Energetik France",
-  "license": "MIT"
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
