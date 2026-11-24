@@ -174,6 +174,7 @@ async function createEstimate(clientId, subject, items) {
       client_id: clientId,
       subject: subject,
       status: 'draft',
+      lié: null,
       items: items.map(item => ({
         description: item.description,
         quantity: item.quantity,
@@ -181,6 +182,7 @@ async function createEstimate(clientId, subject, items) {
       }))
     };
 
+    log('Estimate data to send:', JSON.stringify(estimateData));
     const response = await callSellsyAPI('POST', '/estimates', estimateData);
     log('Estimate created with ID:', response.data.id);
     return response.data;
