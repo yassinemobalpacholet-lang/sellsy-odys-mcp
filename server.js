@@ -35,31 +35,47 @@ async function getSellsyToken() {
 
   const tokenUrl = 'https://api.sellsy.com/oauth2/access_token';
 
-  const response = await fetch(tokenUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded'
-    },
-    body: new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: SELLSY_ID,
-      client_secret: SELLSY_SECRET
-    })
-  });
+  try {
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: SELLSY_ID,
+        client_secret: SELLSY_SECRET
+      })
+    });
 
-  if (!response.ok) {
-    throw new Error(`Sellsy token error: ${response.status} ${response.statusText}`);
+    const responseText = await response.text();
+
+    if (!response.ok) {
+      throw new Error(`Sellsy auth failed (${response.status}): ${responseText.substring(0, 200)}`);
+    }
+
+    let data;
+    try {
+      data = JSON.parse(responseText);
+    } catch (e) {
+      throw new Error(`Invalid JSON from Sellsy: ${responseText.substring(0, 200)}`);
+    }
+
+    if (!data.access_token) {
+      throw new Error(`No access_token in Sellsy response: ${JSON.stringify(data)}`);
+    }
+
+    // Cache the token with 1 hour expiry
+    tokenCache = {
+      access_token: data.access_token,
+      expires_at: Date.now() + (data.expires_in || 3600) * 1000
+    };
+
+    return data.access_token;
+  } catch (error) {
+    console.error('❌ Sellsy Token Error:', error.message);
+    throw error;
   }
-
-  const data = await response.json();
-
-  // Cache the token with 1 hour expiry
-  tokenCache = {
-    access_token: data.access_token,
-    expires_at: Date.now() + (data.expires_in || 3600) * 1000
-  };
-
-  return data.access_token;
 }
 
 async function callSellsyAPI(method, endpoint, body = null) {
@@ -79,14 +95,26 @@ async function callSellsyAPI(method, endpoint, body = null) {
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetch(url, options);
+  try {
+    const response = await fetch(url, options);
+    const responseText = await response.text();
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Sellsy API error: ${response.status} - ${errorText}`);
+    if (!response.ok) {
+      throw new Error(`Sellsy API error (${response.status}): ${responseText.substring(0, 200)}`);
+    }
+
+    let data;
+    try {
+      data = JSON.parse(responseText);
+    } catch (e) {
+      throw new Error(`Invalid JSON from Sellsy API: ${responseText.substring(0, 200)}`);
+    }
+
+    return data;
+  } catch (error) {
+    console.error('❌ Sellsy API Error:', error.message);
+    throw error;
   }
-
-  return await response.json();
 }
 
 async function findOrCreateClient(email, name) {
@@ -94,8 +122,10 @@ async function findOrCreateClient(email, name) {
     // Search for existing client
     const searchResponse = await callSellsyAPI('GET', `/contacts?email=${encodeURIComponent(email)}`);
 
-    if (searchResponse.data && searchResponse.data.length > 0) {
-      return searchResponse.data[0].id;
+    // Handle different response formats
+    const contacts = searchResponse.data || searchResponse;
+    if (Array.isArray(contacts) && contacts.length > 0) {
+      return contacts[0].id;
     }
 
     // Create new client if not found
@@ -105,9 +135,11 @@ async function findOrCreateClient(email, name) {
       type: 'person'
     });
 
-    return createResponse.data.id;
+    // Handle different response formats
+    const newContact = createResponse.data || createResponse;
+    return newContact.id;
   } catch (error) {
-    console.error('Client management error:', error);
+    console.error('❌ Client management error:', error.message);
     throw error;
   }
 }
@@ -127,9 +159,12 @@ async function createEstimate(clientId, items, subject) {
     };
 
     const response = await callSellsyAPI('POST', '/estimates', estimateData);
-    return response.data;
+
+    // Handle different response formats
+    const estimate = response.data || response;
+    return estimate;
   } catch (error) {
-    console.error('Estimate creation error:', error);
+    console.error('❌ Estimate creation error:', error.message);
     throw error;
   }
 }
@@ -205,7 +240,7 @@ async function handleMCPMessage(message) {
         },
         serverInfo: {
           name: 'Sellsy-Odys MCP',
-          version: '1.0.0'
+          version: '1.0.1'
         }
       }
     };
@@ -246,6 +281,7 @@ async function handleMCPMessage(message) {
         result
       };
     } catch (error) {
+      console.error('❌ Tool Error:', error.message);
       return {
         jsonrpc: '2.0',
         id: message.id,
@@ -290,7 +326,7 @@ app.post('/mcp/:key', async (req, res) => {
     const response = await handleMCPMessage(message);
     res.json(response);
   } catch (error) {
-    console.error('MCP Error:', error);
+    console.error('❌ MCP Error:', error.message);
     res.status(500).json({
       jsonrpc: '2.0',
       error: {
@@ -305,7 +341,7 @@ app.post('/mcp/:key', async (req, res) => {
 app.get('/mcp/info', (req, res) => {
   res.json({
     name: 'Sellsy-Odys MCP',
-    version: '1.0.0',
+    version: '1.0.1',
     description: 'MCP server for integrating Sellsy CRM with Odys workflow management',
     tools: MCP_TOOLS.map(t => ({ name: t.name, description: t.description }))
   });
@@ -315,7 +351,7 @@ app.get('/mcp/info', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     message: 'Sellsy-Odys MCP Server',
-    version: '1.0.0',
+    version: '1.0.1',
     endpoints: {
       health: 'GET /health',
       mcp_info: 'GET /mcp/info',
@@ -326,7 +362,7 @@ app.get('/', (req, res) => {
 
 // Error handling
 app.use((err, req, res, next) => {
-  console.error('Express Error:', err);
+  console.error('❌ Express Error:', err.message);
   res.status(500).json({
     error: 'Internal server error',
     message: err.message
