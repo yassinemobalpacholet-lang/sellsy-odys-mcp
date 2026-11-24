@@ -243,7 +243,24 @@ async function handleMCPMessage(message) {
 
     if (name === 'create_estimate') {
       try {
-        const { client_email, client_name, items, subject } = args || {};
+        // Support both Odys structure and direct structure
+        let client_email, client_name, items, subject;
+
+        // Check if args has job.client structure (Odys format)
+        if (args.job && args.job.client) {
+          const jobClient = args.job.client;
+          client_email = jobClient.email;
+          client_name = `${jobClient.prenom} ${jobClient.nom}`;
+          subject = jobClient.subject || `Devis ${jobClient.nom}`;
+          items = (jobClient.rows || []).map(row => ({
+            description: row.nom || row.name || 'Article',
+            quantity: row.qte || row.quantity || 1,
+            unit_price: parseFloat(row.pu || row.unit_price || 0)
+          }));
+        } else {
+          // Direct parameter structure
+          ({ client_email, client_name, items, subject } = args || {});
+        }
 
         // Validation des paramètres requis
         if (!client_email) {
@@ -252,8 +269,8 @@ async function handleMCPMessage(message) {
         if (!client_name) {
           throw new Error('Missing required parameter: client_name');
         }
-        if (!items || !Array.isArray(items)) {
-          throw new Error('Missing or invalid parameter: items (must be array)');
+        if (!items || !Array.isArray(items) || items.length === 0) {
+          throw new Error('Missing or invalid parameter: items (must be non-empty array)');
         }
         if (!subject) {
           throw new Error('Missing required parameter: subject');
@@ -373,3 +390,4 @@ app.listen(PORT, () => {
 });
 
 export default app;
+
