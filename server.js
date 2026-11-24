@@ -329,7 +329,7 @@ app.listen(PORT, () => {
   log('MCP Key configured:', ODYS_KEY ? 'YES' : 'NO');
   log('Sellsy ID configured:', SELLSY_ID !== 'default-id' ? 'YES' : 'NO');
   log('Sellsy Secret configured:', SELLSY_SECRET !== 'default-secret' ? 'YES' : 'NO');
-log('OAuth2 Endpoint:', 'https://login.sellsy.com/oauth2/access-tokens); 
+  log('OAuth2 Endpoint:', 'https://oauth.sellsy.com/oauth2/token');
   log('='.repeat(60));
 });
 
