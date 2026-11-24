@@ -66,7 +66,7 @@ async function getSellsyToken() {
   log('Requesting new token from Sellsy OAuth2');
   log('Using credentials:', `ID=${SELLSY_ID.substring(0, 8)}...`);
 
-  const tokenUrl = 'https://login.sellsy.com/oauth2/access-tokens';
+ const tokenUrl = 'https://login.sellsy.com/oauth2/access-tokens';
 
   try {
     const response = await fetch(tokenUrl, {
@@ -329,7 +329,7 @@ app.listen(PORT, () => {
   log('MCP Key configured:', ODYS_KEY ? 'YES' : 'NO');
   log('Sellsy ID configured:', SELLSY_ID !== 'default-id' ? 'YES' : 'NO');
   log('Sellsy Secret configured:', SELLSY_SECRET !== 'default-secret' ? 'YES' : 'NO');
-  log('OAuth2 Endpoint:', 'https://oauth.sellsy.com/oauth2/token');
+log('OAuth2 Endpoint:', 'https://login.sellsy.com/oauth2/access-tokens');
   log('='.repeat(60));
 });
 
