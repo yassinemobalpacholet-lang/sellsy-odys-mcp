@@ -224,6 +224,7 @@ async function handleMCPMessage(message) {
   if (method === 'tools/call') {
     const { name, arguments: args } = params;
     log('Calling tool:', name);
+    log('Tool arguments:', JSON.stringify(args));
 
     if (name === 'ping') {
       return {
@@ -242,7 +243,24 @@ async function handleMCPMessage(message) {
 
     if (name === 'create_estimate') {
       try {
-        const { client_email, client_name, items, subject } = args;
+        const { client_email, client_name, items, subject } = args || {};
+
+        // Validation des paramètres requis
+        if (!client_email) {
+          throw new Error('Missing required parameter: client_email');
+        }
+        if (!client_name) {
+          throw new Error('Missing required parameter: client_name');
+        }
+        if (!items || !Array.isArray(items)) {
+          throw new Error('Missing or invalid parameter: items (must be array)');
+        }
+        if (!subject) {
+          throw new Error('Missing required parameter: subject');
+        }
+
+        log('create_estimate parameters valid:', { client_email, client_name, itemCount: items.length, subject });
+
         const clientId = await findOrCreateClient(client_email, client_name);
         const estimate = await createEstimate(clientId, subject, items);
 
