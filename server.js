@@ -66,7 +66,7 @@ async function getSellsyToken() {
   log('Requesting new token from Sellsy OAuth2');
   log('Using credentials:', `ID=${SELLSY_ID.substring(0, 8)}...`);
 
- const tokenUrl = 'https://login.sellsy.com/oauth2/access-tokens';
+  const tokenUrl = 'https://login.sellsy.com/oauth2/access-tokens';
 
   try {
     const response = await fetch(tokenUrl, {
@@ -198,19 +198,27 @@ async function handleMCPMessage(message) {
 
   if (method === 'initialize') {
     return {
-      protocolVersion: '2024-11-05',
-      capabilities: {
-        tools: {}
+      jsonrpc: '2.0',
+      result: {
+        protocolVersion: '2024-11-05',
+        capabilities: {
+          tools: {}
+        },
+        serverInfo: {
+          name: 'Sellsy-Odys-MCP',
+          version: '1.0.0'
+        }
       },
-      serverInfo: {
-        name: 'Sellsy-Odys-MCP',
-        version: '1.0.0'
-      }
+      id: message.id
     };
   }
 
   if (method === 'tools/list') {
-    return { tools };
+    return {
+      jsonrpc: '2.0',
+      result: { tools },
+      id: message.id
+    };
   }
 
   if (method === 'tools/call') {
@@ -219,12 +227,16 @@ async function handleMCPMessage(message) {
 
     if (name === 'ping') {
       return {
-        content: [
-          {
-            type: 'text',
-            text: 'Sellsy-Odys-MCP server is running!'
-          }
-        ]
+        jsonrpc: '2.0',
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: 'Sellsy-Odys-MCP server is running!'
+            }
+          ]
+        },
+        id: message.id
       };
     }
 
@@ -235,39 +247,48 @@ async function handleMCPMessage(message) {
         const estimate = await createEstimate(clientId, subject, items);
 
         return {
-          content: [
-            {
-              type: 'text',
-              text: `Estimate created successfully! ID: ${estimate.id}`
-            }
-          ]
+          jsonrpc: '2.0',
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: `Estimate created successfully! ID: ${estimate.id}`
+              }
+            ]
+          },
+          id: message.id
         };
       } catch (error) {
         log('ERROR in create_estimate tool:', error.message);
         return {
-          content: [
-            {
-              type: 'text',
-              text: `Error creating estimate: ${error.message}`
-            }
-          ],
-          isError: true
+          jsonrpc: '2.0',
+          error: {
+            code: -32603,
+            message: `Error creating estimate: ${error.message}`
+          },
+          id: message.id
         };
       }
     }
 
     return {
-      content: [
-        {
-          type: 'text',
-          text: `Unknown tool: ${name}`
-        }
-      ],
-      isError: true
+      jsonrpc: '2.0',
+      error: {
+        code: -32602,
+        message: `Unknown tool: ${name}`
+      },
+      id: message.id
     };
   }
 
-  return { error: 'Unknown method' };
+  return {
+    jsonrpc: '2.0',
+    error: {
+      code: -32601,
+      message: 'Method not found'
+    },
+    id: message.id
+  };
 }
 
 // Routes
@@ -329,7 +350,7 @@ app.listen(PORT, () => {
   log('MCP Key configured:', ODYS_KEY ? 'YES' : 'NO');
   log('Sellsy ID configured:', SELLSY_ID !== 'default-id' ? 'YES' : 'NO');
   log('Sellsy Secret configured:', SELLSY_SECRET !== 'default-secret' ? 'YES' : 'NO');
-log('OAuth2 Endpoint:', 'https://login.sellsy.com/oauth2/access-tokens');
+  log('OAuth2 Endpoint:', 'https://oauth.sellsy.com/oauth2/token');
   log('='.repeat(60));
 });
 
