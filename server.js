@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.11.1';
+const VERSION = '2.12.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -369,6 +369,7 @@ function fillDesc(html, f) {
     const m = d.match(/<strong>\s*R(?:é|&eacute;)f(?:é|&eacute;)rence\s*:\s*<\/strong>[^<]*<br\s*\/?>/i);
     d = m ? d.replace(m[0], m[0] + line) : d + (d ? '<br />' : '') + line;
   }
+  if (f.repere) d = '<strong>Repère : </strong>' + txt(f.repere) + '<br />' + d.replace(/^<strong>Rep(?:è|&egrave;)re : <\/strong>[^<]*<br \/>/i, '');
   return d;
 }
 
