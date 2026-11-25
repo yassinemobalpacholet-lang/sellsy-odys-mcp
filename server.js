@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.10.0';
+const VERSION = '2.11.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -85,6 +85,7 @@ const TOOLS = [{
       estimate_id: { type: 'number', description: 'ID Sellsy du devis' },
       client_email: { type: 'string' },
       client_name: { type: 'string', description: 'Civilité et nom, ex. « M. Dupont »' },
+      bcc_emails: { type: 'array', description: 'Destinataires en copie cachée', items: { type: 'string' } },
     },
     required: ['estimate_id', 'client_email'],
   },
@@ -299,19 +300,34 @@ ${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-colla
 
 const FINAL_STATUS = ['accepted', 'refused', 'cancelled', 'advanced', 'invoiced', 'partialinvoiced'];
 const eurFr = v => Number(v || 0).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
-async function sendRelanceEmail(env, { to, name, est }) {
+const MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+async function sendRelanceEmail(env, { to, name, est, bcc }) {
   if (!to) throw new Error('Adresse e-mail du client absente');
-  const lien = safeUrl(est.public) || safeUrl(est.pdf);
+  const expired = est.status === 'expired';
+  const lien = expired ? null : safeUrl(est.public);
+  const d = est.date ? new Date(est.date + 'T12:00:00') : null, jours = d ? Math.round((Date.now() - d) / 864e5) : 7;
+  const quand = !d || jours <= 10 ? 'Il y a une semaine' : 'Le ' + d.getDate() + (d.getDate() === 1 ? 'er' : '') + ' ' + MOIS[d.getMonth()] + (d.getFullYear() !== new Date().getFullYear() ? ' ' + d.getFullYear() : '');
+  // PDF du devis joint (le lien de téléchargement Sellsy expire au bout de quelques minutes)
+  let attachment = [];
+  if (est.pdf) {
+    try {
+      const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 20000);
+      const r = await fetch(est.pdf, { signal: ctl.signal }); clearTimeout(tm);
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (r.ok && buf.slice(0, 4).toString() === '%PDF') attachment = [{ name: 'Devis ' + String(est.number).replace(/[\\/:*?"<>|]+/g, '_') + '.pdf', content: buf.toString('base64') }];
+    } catch (e) { /* relance envoyée sans pièce jointe */ }
+  }
   const html = `<p>Bonjour${name ? ' ' + esc(name) : ''},</p>
-<p>Il y a une semaine, nous vous avons transmis notre devis n° <b>${esc(est.number)}</b> d'un montant de <b>${esc(eurFr(est.ttc))} TTC</b>.</p>
+<p>${esc(quand)}, nous vous avons transmis notre devis n° <b>${esc(est.number)}</b> d'un montant de <b>${esc(eurFr(est.ttc))} TTC</b>${attachment.length ? ' (vous le retrouverez en pièce jointe)' : ''}.</p>
 <p>Avez-vous pu en prendre connaissance ? Nous restons à votre disposition pour répondre à vos questions ou ajuster la proposition si besoin.</p>
+${expired ? '<p>La durée de validité de ce devis étant dépassée, nous pouvons vous en adresser une version actualisée sur simple demande.</p>' : ''}
 <p>N'hésitez pas à revenir vers nous pour nous tenir informés de l'avancement de votre projet, même si votre décision n'est pas encore prise.</p>
 ${lien ? `<p>👉 <a href="${esc(lien)}"><b>Consulter et signer mon devis en ligne</b></a></p>` : ''}
 <p>Vous pouvez simplement répondre à cet e-mail ou nous appeler au <b>02 40 45 79 33</b>.</p>
 <p>Cordialement,<br><b>L'équipe ENERGETIK FRANCE</b><br>13 rue de la Dutée — 44800 Saint-Herblain<br>02 40 45 79 33 · <a href="mailto:contact@energetikfrance.fr">contact@energetikfrance.fr</a></p>`;
-  return sendMail(env, { to, name, subject: 'Votre devis ENERGETIK FRANCE n° ' + est.number, html });
+  return sendMail(env, { to, name, subject: 'Votre devis ENERGETIK FRANCE n° ' + est.number, html, attachment, bcc });
 }
-async function sendMail(env, { to, name, subject, html }) {
+async function sendMail(env, { to, name, subject, html, attachment, bcc }) {
   const from = env.FROM_EMAIL || env.SMTP_USER || 'contact@energetikfrance.fr';
   if (env.BREVO_API_KEY) {
     const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 15000);
@@ -319,7 +335,7 @@ async function sendMail(env, { to, name, subject, html }) {
       const r = await fetch('https://api.brevo.com/v3/smtp/email', {
         method: 'POST', signal: ctl.signal,
         headers: { 'api-key': env.BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ sender: { name: env.FROM_NAME || 'ENERGETIK FRANCE', email: from }, replyTo: { email: from, name: 'ENERGETIK FRANCE' }, to: [{ email: to, name: name || undefined }], subject, htmlContent: html }),
+        body: JSON.stringify(Object.assign({ sender: { name: env.FROM_NAME || 'ENERGETIK FRANCE', email: from }, replyTo: { email: from, name: 'ENERGETIK FRANCE' }, to: [{ email: to, name: name || undefined }], subject, htmlContent: html }, (attachment || []).length ? { attachment } : {}, (bcc || []).length ? { bcc: bcc.map(email => ({ email })) } : {})),
       });
       const txt = await r.text();
       if (!r.ok) throw new Error('Brevo ' + r.status + ' : ' + txt.slice(0, 300));
@@ -461,10 +477,10 @@ async function handle(env, m) {
         }
         if (name === 'send_relance') {
           const est = summary(await new Sellsy(env).call('GET', '/estimates/' + Number(args.estimate_id)));
-          if (FINAL_STATUS.includes(est.status)) {
+          if (FINAL_STATUS.includes(est.status) || est.status === 'draft') {
             return ok(m.id, { content: [{ type: 'text', text: 'Pas de relance : devis ' + est.number + ' au statut ' + est.status }], structuredContent: { ok: true, skipped: true, status: est.status, number: est.number }, isError: false });
           }
-          const id = await sendRelanceEmail(env, { to: args.client_email, name: args.client_name, est });
+          const id = await sendRelanceEmail(env, { to: args.client_email, name: args.client_name, est, bcc: emailList(args.bcc_emails, 'copie cachée') });
           return ok(m.id, { content: [{ type: 'text', text: 'Relance du devis ' + est.number + ' envoyée à ' + args.client_email }], structuredContent: { ok: true, skipped: false, status: est.status, number: est.number, messageId: id }, isError: false });
         }
         if (name === 'catalog_api') {
