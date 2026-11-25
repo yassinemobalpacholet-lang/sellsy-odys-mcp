@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.2.0';
+const VERSION = '2.3.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -50,6 +50,20 @@ const TOOLS = [{
       items: { type: 'array', description: 'Lignes [{nom, qte, pu, fiche_technique}]', items: { type: 'object' } },
     },
     required: ['estimate_id', 'client_email'],
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+}, {
+  name: 'catalog_api',
+  title: 'Gérer le catalogue Sellsy',
+  description: "Lit ou modifie le catalogue Sellsy (articles, taxes, unités) : appel direct de l'API Sellsy V2 limité aux chemins /items, /taxes et /units, sans suppression.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH'] },
+      path: { type: 'string', description: 'Chemin API V2, ex. /items?limit=100 ou /items/123' },
+      body: { type: 'object' },
+    },
+    required: ['method', 'path'],
   },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 }, {
@@ -269,6 +283,13 @@ async function handle(env, m) {
           const est = summary(await sy.call('GET', '/estimates/' + Number(args.estimate_id)));
           const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items });
           return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + args.client_email }], structuredContent: { ok: true, number: est.number, messageId: id }, isError: false });
+        }
+        if (name === 'catalog_api') {
+          const meth = String(args.method || 'GET').toUpperCase(), path = String(args.path || '');
+          if (!['GET', 'POST', 'PUT', 'PATCH'].includes(meth)) throw new Error('Méthode non autorisée');
+          if (!/^\/(items|taxes|units)(\/|\?|$)/.test(path) || path.includes('..')) throw new Error('Chemin non autorisé : ' + path);
+          const r = await new Sellsy(env).call(meth, path, meth === 'GET' ? undefined : (args.body || {}));
+          return ok(m.id, { content: [{ type: 'text', text: JSON.stringify(r).slice(0, 60000) }], structuredContent: r, isError: false });
         }
         if (name === 'ping') {
           const sy = new Sellsy(env); await sy.auth();
