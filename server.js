@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.14.4';
+const VERSION = '2.15.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -121,6 +121,9 @@ function phone(s) {
   return d ? '+' + d : null;
 }
 const clean = o => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined && v !== ''));
+
+/* Signature : nom et mobile du commercial du dossier */
+for (const t of TOOLS) if (t.name === 'send_estimate' || t.name === 'send_relance') Object.assign(t.inputSchema.properties, { signer_name: { type: 'string', description: 'Nom du commercial (signature de l\'e-mail)' }, signer_phone: { type: 'string', description: 'Mobile du commercial (signature)' } });
 
 class Sellsy {
   constructor(env) { this.env = env; this.token = null; this.taxes = null; }
@@ -262,7 +265,7 @@ async function fetchUrlAttachments(list) {
 /* Signature des e-mails clients (modèle C) — logo servi par ce serveur */
 const PUBLIC_URL = String(process.env.PUBLIC_URL || 'https://sellsy-odys-mcp-production.up.railway.app').replace(/\/$/, '');
 function signatureHtml(nom, tel) {
-  nom = nom || 'Yassine Erras'; tel = tel || '06 98 19 07 24';
+  nom = String(nom || '').trim() || 'ENERGETIK FRANCE'; tel = String(tel || '').trim();
   const seg = c => `<td height="3" bgcolor="${c}" style="font-size:0;line-height:0;height:3px">&nbsp;</td>`;
   const F = 'font-family:Arial,Helvetica,sans-serif;';
   return `<table cellpadding="0" cellspacing="0" border="0" role="presentation" width="520" style="${F}margin-top:6px;border-collapse:collapse;max-width:520px">` +
@@ -270,13 +273,26 @@ function signatureHtml(nom, tel) {
     `<tr><td width="150" valign="middle" style="padding-right:12px"><img src="${PUBLIC_URL}/logo-energetik.png" width="135" height="71" alt="ENERGETIK FRANCE" style="display:block;border:0;outline:none;text-decoration:none"></td>` +
     `<td valign="middle" style="${F}font-size:13px;line-height:20px;color:#555555">` +
     `<div style="font-size:16px;line-height:22px;font-weight:bold;color:#2b2b2b">${esc(nom)}</div>` +
-    `<div>Mobile ${esc(tel)} · Agence 02 40 45 79 33</div>` +
+    `<div>${tel ? 'Mobile ' + esc(tel) + ' · ' : ''}Agence 02 40 45 79 33</div>` +
     `<div>13 rue de la Dutée, 44800 Saint-Herblain</div>` +
     `<div><a href="https://www.energetikfrance.fr/" style="color:#3E8C86;text-decoration:none;font-weight:bold">www.energetikfrance.fr</a></div></td></tr>` +
     `<tr><td colspan="2" style="padding-top:14px"><table cellpadding="0" cellspacing="0" border="0" role="presentation" width="100%" style="border-top:1px solid #e6e6e6"><tr>` +
     `<td valign="middle" style="${F}font-size:12px;line-height:17px;color:#888888;padding-top:10px">Entreprise certifiée RGE<br>Pompes à chaleur · isolation · ventilation</td>` +
     `<td valign="middle" align="right" style="padding-top:10px;white-space:nowrap"><img src="${PUBLIC_URL}/cert/qualipac.png" width="97" height="40" alt="RGE QualiPAC 2026" style="width:97px;height:40px;border:0;vertical-align:middle">&nbsp;&nbsp;<img src="${PUBLIC_URL}/cert/ventilation.png" width="97" height="40" alt="RGE Ventilation+ 2026" style="width:97px;height:40px;border:0;vertical-align:middle">&nbsp;&nbsp;<img src="${PUBLIC_URL}/cert/ppe.png" width="30" height="56" alt="RGE Les Pros de la performance énergétique" style="width:30px;height:56px;border:0;vertical-align:middle">&nbsp;&nbsp;<img src="${PUBLIC_URL}/cert/qualibat.png" height="48" alt="RGE Qualibat" style="height:48px;width:auto;border:0;vertical-align:middle"></td>` +
     `</tr></table></td></tr></table>`;
+}
+/* Message en texte → HTML : bouton et tableau avant la formule de politesse, signature HTML à la fin (lignes de signature en texte retirées) */
+const SIG_DUP = /13 rue de la dut|44800|02[ .]?40[ .]?45[ .]?79[ .]?33|contact@energetikfrance|^l.?[ée]quipe energetik|^energetik france$|^0[67]([ .]?\d\d){4}$/i;
+function messageHtml(text, extra, signer) {
+  const P = String(text || '').trim().split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+  const nm = String((signer && signer.name) || '').trim().toLowerCase();
+  const dup = l => { const x = l.trim().toLowerCase(); return !x || SIG_DUP.test(l.trim()) || /yassine erras/.test(x) || (nm && x.startsWith(nm)); };
+  let k = P.findIndex(p => /^(bien )?cordialement|^bien à vous|^sincères salutations|^salutations/i.test(p));
+  if (k < 0) k = P.length;
+  else { P[k] = P[k].split('\n')[0]; for (let i = k + 1; i < P.length; i++) P[i] = P[i].split('\n').filter(l => !dup(l)).join('\n'); }
+  const H = P.map(p => p ? '<p>' + esc(p).replace(/\n/g, '<br>') + '</p>' : '');
+  if (extra) H.splice(k, 0, extra);
+  return H.filter(Boolean).join('\n') + signatureHtml(signer && signer.name, signer && signer.phone);
 }
 function cleanAttachments(a) {
   if (!Array.isArray(a) || !a.length) return [];
@@ -298,7 +314,7 @@ function emailList(v, label) {
   if (a.length > 10) throw new Error('10 adresses maximum (' + label + ')');
   return [...new Set(a.map(x => x.toLowerCase()))];
 }
-async function sendEstimateEmail(env, { to, name, est, items, attachments, subject: subj, message, includeItems, toMore, bcc }) {
+async function sendEstimateEmail(env, { to, name, est, items, attachments, subject: subj, message, includeItems, toMore, bcc, signer }) {
   if (!to) throw new Error('Adresse e-mail du client absente');
   const lines = (items || []).filter(r => r && r.type !== 'title').map(r => {
     const fiche = safeUrl(r.fiche_technique || r.datasheet_url);
@@ -308,13 +324,12 @@ async function sendEstimateEmail(env, { to, name, est, items, attachments, subje
   const lien = safeUrl(est.public) || safeUrl(est.pdf);
   const table = lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse"><tr style="background:#f2f2f2"><th>Article</th><th>Qté</th><th>Fiche technique</th></tr>${lines}</table>` : '';
   const custom = String(message || '').trim();
-  const html = custom ? custom.split(/\n\s*\n/).map(p => '<p>' + esc(p.trim()).replace(/\n/g, '<br>') + '</p>').join('\n') +
-    (lien ? `\n<p>👉 <a href="${esc(lien)}"><b>Consulter et signer mon devis en ligne</b></a></p>` : '') + (includeItems ? '\n' + table : '')
+  const html = custom ? messageHtml(custom, (lien ? `<p>👉 <a href="${esc(lien)}"><b>Consulter et signer mon devis en ligne</b></a></p>` : '') + (includeItems ? table : ''), signer)
   : `<p>Bonjour${name ? ' ' + esc(name) : ''},</p>
 <p>Veuillez trouver ci-joint votre devis <b>${esc(est.number || est.id)}</b>${est.subject ? ' (' + esc(est.subject) + ')' : ''}${lien ? ` (également consultable en ligne : <a href="${esc(lien)}">consulter le devis</a>)` : ''}.</p>
 ${(attachments || []).length ? `<p>Vous trouverez en pièces jointes : ${(attachments || []).map(x => esc(x.name.replace(/\.[a-z]+$/i, ''))).join(', ')}.</p>` : ''}
 ${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse"><tr style="background:#f2f2f2"><th>Article</th><th>Qté</th><th>Fiche technique</th></tr>${lines}</table>` : ''}
-<p>Cordialement,<br><b>ENERGETIK FRANCE</b><br>02 40 45 79 33 · <a href="mailto:contact@energetikfrance.fr">contact@energetikfrance.fr</a></p>`;
+<p>Cordialement,</p>${signatureHtml(signer && signer.name, signer && signer.phone)}`;
   const subject = String(subj || '').trim().slice(0, 200) || ('Votre devis ENERGETIK FRANCE ' + (est.number || ''));
   const from = env.FROM_EMAIL || env.SMTP_USER || 'contact@energetikfrance.fr';
   if (env.BREVO_API_KEY) {
@@ -339,7 +354,7 @@ ${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-colla
 const FINAL_STATUS = ['accepted', 'refused', 'cancelled', 'advanced', 'invoiced', 'partialinvoiced'];
 const eurFr = v => Number(v || 0).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
 const MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
-async function sendRelanceEmail(env, { to, name, est, bcc }) {
+async function sendRelanceEmail(env, { to, name, est, bcc, signer }) {
   if (!to) throw new Error('Adresse e-mail du client absente');
   const expired = est.status === 'expired';
   const lien = expired ? null : safeUrl(est.public);
@@ -362,7 +377,7 @@ ${expired ? '<p>La durée de validité de ce devis étant dépassée, nous pouvo
 <p>N'hésitez pas à revenir vers nous pour nous tenir informés de l'avancement de votre projet, même si votre décision n'est pas encore prise.</p>
 ${lien ? `<p>👉 <a href="${esc(lien)}"><b>Consulter et signer mon devis en ligne</b></a></p>` : ''}
 <p>Vous pouvez simplement répondre à cet e-mail ou nous appeler au <b>02 40 45 79 33</b>.</p>
-<p>Cordialement,<br><b>L'équipe ENERGETIK FRANCE</b><br>13 rue de la Dutée — 44800 Saint-Herblain<br>02 40 45 79 33 · <a href="mailto:contact@energetikfrance.fr">contact@energetikfrance.fr</a></p>`;
+<p>Cordialement,</p>${signatureHtml(signer && signer.name, signer && signer.phone)}`;
   return sendMail(env, { to, name, subject: 'Votre devis ENERGETIK FRANCE n° ' + est.number, html, attachment, bcc });
 }
 async function sendMail(env, { to, name, subject, html, attachment, bcc }) {
@@ -501,7 +516,7 @@ async function handle(env, m) {
           }
           est.pdf = null; // jamais de lien de téléchargement temporaire dans l'e-mail
           if (wasDraft && args.mark_sent === false) est.public = null; // envoi de test : le lien client ne s'ouvre pas tant que le devis est brouillon
-          const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items, attachments: att, toMore, bcc, subject: args.subject, message: args.message, includeItems: args.include_items === undefined ? !args.message : !!args.include_items });
+          const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items, attachments: att, toMore, bcc, signer: { name: args.signer_name, phone: args.signer_phone }, subject: args.subject, message: args.message, includeItems: args.include_items === undefined ? !args.message : !!args.include_items });
           (args.attachment_ids || []).forEach(k => STAGE.delete(String(k)));
           // Une fois l'e-mail parti, le devis brouillon passe au statut « Envoyé » dans Sellsy (sauf envoi de test)
           let statut = est.status, statutErreur = '';
@@ -520,7 +535,7 @@ async function handle(env, m) {
           if (FINAL_STATUS.includes(est.status) || est.status === 'draft') {
             return ok(m.id, { content: [{ type: 'text', text: 'Pas de relance : devis ' + est.number + ' au statut ' + est.status }], structuredContent: { ok: true, skipped: true, status: est.status, number: est.number }, isError: false });
           }
-          const id = await sendRelanceEmail(env, { to: args.client_email, name: args.client_name, est, bcc: emailList(args.bcc_emails, 'copie cachée') });
+          const id = await sendRelanceEmail(env, { to: args.client_email, name: args.client_name, est, signer: { name: args.signer_name, phone: args.signer_phone }, bcc: emailList(args.bcc_emails, 'copie cachée') });
           return ok(m.id, { content: [{ type: 'text', text: 'Relance du devis ' + est.number + ' envoyée à ' + args.client_email }], structuredContent: { ok: true, skipped: false, status: est.status, number: est.number, messageId: id }, isError: false });
         }
         if (name === 'catalog_api') {
@@ -612,7 +627,7 @@ app.get('/cert/:name.png', async (req, res) => {
     res.set({ 'Content-Type': c.type, 'Cache-Control': 'public, max-age=604800' }); res.send(c.buf);
   } catch (e) { res.status(502).end(); }
 });
-app.get('/signature', (req, res) => res.type('html').send('<!doctype html><meta charset="utf-8"><title>Signature e-mail</title><body style="margin:40px;background:#fff;font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222"><p>Bonjour,</p><p>[corps du message]</p><p>Cordialement,</p>' + signatureHtml() + '</body>'));
+app.get('/signature', (req, res) => res.type('html').send('<!doctype html><meta charset="utf-8"><title>Signature e-mail</title><body style="margin:40px;background:#fff;font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222"><p>Bonjour,</p><p>[corps du message]</p><p>Cordialement,</p>' + signatureHtml('Yassine Erras', '06 98 19 07 24') + '</body>'));
 
 // JSON mal formé
 app.use((e, req, res, next) => res.status(400).json(err(null, -32700, 'JSON invalide')));
