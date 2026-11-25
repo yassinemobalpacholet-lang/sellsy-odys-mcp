@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.4.1';
+const VERSION = '2.5.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -272,6 +272,22 @@ function summary(e) {
   };
 }
 
+
+/* Complète le descriptif d'un article (superficie, chaudière remplacée, n° EPREL) */
+const DOTS = '(?:\\.|…|&hellip;|&nbsp;|\\u00a0| )*(?:\\.|…|&hellip;){3,}(?:\\.|…|&hellip;|&nbsp;|\\u00a0)*';
+function fillDesc(html, f) {
+  let d = String(html || '');
+  const txt = v => esc(String(v).trim());
+  if (f.superficie) d = d.replace(new RegExp('(Superficie de la maison\\s*:\\s*(?:</strong>)?\\s*)' + DOTS, 'i'), '$1' + txt(f.superficie).replace(/\s*m(²|2)?$/i, '') + ' m²');
+  if (f.chaudiere) d = d.replace(new RegExp("(en remplacement d['’]une chaudi(?:è|&egrave;)re\\s*)" + DOTS, 'i'), '$1' + txt(f.chaudiere));
+  if (f.eprel && !/EPREL/i.test(d)) {
+    const line = "<strong>N° d'enregistrement EPREL : </strong>" + txt(f.eprel) + '<br />';
+    const m = d.match(/<strong>\s*R(?:é|&eacute;)f(?:é|&eacute;)rence\s*:\s*<\/strong>[^<]*<br\s*\/?>/i);
+    d = m ? d.replace(m[0], m[0] + line) : d + (d ? '<br />' : '') + line;
+  }
+  return d;
+}
+
 async function createEstimate(env, job) {
   if (!job || typeof job !== 'object') throw new Error('Demande de devis absente');
   const rows0 = Array.isArray(job.rows) ? job.rows : [];
@@ -282,7 +298,16 @@ async function createEstimate(env, job) {
   for (const r of rows0) {
     if (r.type === 'title') { rows.push({ type: 'title', text: r.text || '' }); continue; }
     const row = { quantity: String(r.qte || 1), unit_amount: Number(r.pu || 0).toFixed(2), tax_id: await sy.taxId(r.tva, job.tvaDefaut || '5.5') };
-    if (r.sellsyId) Object.assign(row, { type: 'catalog', related: { type: 'product', id: Number(r.sellsyId) } });
+    if (r.sellsyId) {
+      Object.assign(row, { type: 'catalog', related: { type: 'product', id: Number(r.sellsyId) } });
+      if (r.fill && typeof r.fill === 'object') {
+        try {
+          const it = await sy.call('GET', '/items/' + Number(r.sellsyId));
+          const d = fillDesc(it.description || '', r.fill);
+          if (d && d !== it.description) Object.assign(row, { reference: it.reference || undefined, description: d });
+        } catch (e) { /* description du catalogue conservée */ }
+      }
+    }
     else Object.assign(row, clean({ type: 'single', reference: String(r.ref || '').slice(0, 100), description: r.nom || '' }));
     rows.push(row);
   }
