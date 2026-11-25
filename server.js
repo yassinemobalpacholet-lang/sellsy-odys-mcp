@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.5.1';
+const VERSION = '2.6.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -48,6 +48,7 @@ const TOOLS = [{
       client_email: { type: 'string' },
       client_name: { type: 'string' },
       items: { type: 'array', description: 'Lignes [{nom, qte, pu, fiche_technique}]', items: { type: 'object' } },
+      attachments: { type: 'array', description: 'Pièces jointes [{name, content (base64)}] : PDF ou images, 10 Mo au total', items: { type: 'object' } },
     },
     required: ['estimate_id', 'client_email'],
   },
@@ -196,7 +197,20 @@ function getMailer(env) {
   }
   return mailer;
 }
-async function sendEstimateEmail(env, { to, name, est, items }) {
+function cleanAttachments(a) {
+  if (!Array.isArray(a) || !a.length) return [];
+  let tot = 0;
+  const out = a.slice(0, 10).map(x => {
+    const name = String((x && x.name) || 'document.pdf').replace(/[\\/:*?"<>|\r\n]+/g, '_').slice(0, 120);
+    const content = String((x && x.content) || '').replace(/^data:[^,]*,/, '').replace(/\s+/g, '');
+    if (!/\.(pdf|png|jpe?g)$/i.test(name)) throw new Error('Pièce jointe refusée (PDF ou image uniquement) : ' + name);
+    if (!content || !/^[A-Za-z0-9+/=]+$/.test(content)) throw new Error('Pièce jointe illisible : ' + name);
+    tot += content.length * 0.75; return { name, content };
+  });
+  if (tot > 10 * 1024 * 1024) throw new Error('Pièces jointes trop lourdes (' + (tot / 1048576).toFixed(1) + ' Mo, 10 Mo maximum)');
+  return out;
+}
+async function sendEstimateEmail(env, { to, name, est, items, attachments }) {
   if (!to) throw new Error('Adresse e-mail du client absente');
   const lines = (items || []).filter(r => r && r.type !== 'title').map(r => {
     const fiche = safeUrl(r.fiche_technique || r.datasheet_url);
@@ -206,6 +220,7 @@ async function sendEstimateEmail(env, { to, name, est, items }) {
   const lien = safeUrl(est.public) || safeUrl(est.pdf);
   const html = `<p>Bonjour${name ? ' ' + esc(name) : ''},</p>
 <p>Veuillez trouver votre devis <b>${esc(est.number || est.id)}</b>${est.subject ? ' (' + esc(est.subject) + ')' : ''}${lien ? ` : <a href="${esc(lien)}">consulter le devis</a>` : ''}.</p>
+${(attachments || []).length ? `<p>Vous trouverez en pièces jointes : ${(attachments || []).map(x => esc(x.name.replace(/\.[a-z]+$/i, ''))).join(', ')}.</p>` : ''}
 ${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse"><tr style="background:#f2f2f2"><th>Article</th><th>Qté</th><th>Fiche technique</th></tr>${lines}</table>` : ''}
 <p>Cordialement,<br><b>ENERGETIK FRANCE</b><br>02 40 45 79 33 · <a href="mailto:contact@energetikfrance.fr">contact@energetikfrance.fr</a></p>`;
   const subject = 'Votre devis ENERGETIK FRANCE ' + (est.number || '');
@@ -217,14 +232,14 @@ ${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-colla
       const r = await fetch('https://api.brevo.com/v3/smtp/email', {
         method: 'POST', signal: ctl.signal,
         headers: { 'api-key': env.BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ sender: { name: env.FROM_NAME || 'ENERGETIK FRANCE', email: from }, to: [{ email: to, name: name || undefined }], subject, htmlContent: html }),
+        body: JSON.stringify(Object.assign({ sender: { name: env.FROM_NAME || 'ENERGETIK FRANCE', email: from }, replyTo: { email: from, name: 'ENERGETIK FRANCE' }, to: [{ email: to, name: name || undefined }], subject, htmlContent: html }, (attachments || []).length ? { attachment: attachments } : {})),
       });
       const txt = await r.text();
       if (!r.ok) throw new Error('Brevo ' + r.status + ' : ' + txt.slice(0, 300));
       return (JSON.parse(txt || '{}').messageId) || 'brevo';
     } finally { clearTimeout(t); }
   }
-  const info = await getMailer(env).sendMail({ from, to, subject, html });
+  const info = await getMailer(env).sendMail({ from, to, subject, html, attachments: (attachments || []).map(x => ({ filename: x.name, content: Buffer.from(x.content, 'base64') })) });
   return info.messageId;
 }
 
@@ -354,7 +369,7 @@ async function handle(env, m) {
         if (name === 'send_estimate') {
           const sy = new Sellsy(env);
           const est = summary(await sy.call('GET', '/estimates/' + Number(args.estimate_id)));
-          const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items });
+          const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items, attachments: cleanAttachments(args.attachments) });
           return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + args.client_email }], structuredContent: { ok: true, number: est.number, messageId: id }, isError: false });
         }
         if (name === 'send_relance') {
@@ -402,7 +417,7 @@ const PORT = env.PORT || 8080;
 const log = (...a) => console.log('[' + new Date().toISOString() + ']', ...a);
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '15mb' }));
 
 app.get('/', (req, res) => res.json({ service: 'Sellsy-Odys-MCP', version: VERSION }));
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
