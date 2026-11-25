@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.14.0';
+const VERSION = '2.14.1';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -511,7 +511,7 @@ async function handle(env, m) {
           const estEdit = (meth === 'PUT' || meth === 'PATCH') && /^\/estimates\/\d+$/.test(path);
           const estStatus = meth === 'PUT' && /^\/estimates\/\d+\/status$/.test(path);
           /* remises TTC (CEE, MaPrimeRénov') : liaison / déliaison sur un devis */
-          const estDisc = (meth === 'POST' || meth === 'DELETE') && /^\/estimates\/\d+\/discount-incl-taxes\/\d+$/.test(path);
+          const estDisc = ((meth === 'POST' || meth === 'DELETE') && /^\/estimates\/\d+\/discount-incl-taxes\/\d+$/.test(path)) || (meth === 'PUT' && /^\/discount-incl-taxes\/\d+$/.test(path));
           if (meth === 'DELETE' && !estDisc) throw new Error('Suppression non autorisée : ' + path);
           if (path.includes('..') || !(/^\/(items|taxes|units)(\/|\?|$)/.test(path) || estEdit || estStatus || estDisc || (readOnly && meth === 'GET') || (meth === 'POST' && /^\/(individuals|companies|estimates)\/search(\?|$)/.test(path)))) throw new Error('Chemin non autorisé : ' + path);
           if (estEdit) { const cur = await new Sellsy(env).call('GET', path); if (cur.status !== 'draft') throw new Error('Seul un devis en brouillon peut être modifié (statut : ' + cur.status + ')'); }
