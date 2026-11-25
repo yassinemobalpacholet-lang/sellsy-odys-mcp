@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.11.0';
+const VERSION = '2.11.1';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -486,7 +486,7 @@ async function handle(env, m) {
         if (name === 'catalog_api') {
           const meth = String(args.method || 'GET').toUpperCase(), path = String(args.path || '');
           if (!['GET', 'POST', 'PUT', 'PATCH'].includes(meth)) throw new Error('Méthode non autorisée');
-          const readOnly = /^\/(individuals|companies|contacts|estimates|search)(\/|\?|$)/.test(path);
+          const readOnly = /^\/(individuals|companies|contacts|estimates|search|staffs)(\/|\?|$)/.test(path);
           const estEdit = (meth === 'PUT' || meth === 'PATCH') && /^\/estimates\/\d+$/.test(path);
           const estStatus = meth === 'PUT' && /^\/estimates\/\d+\/status$/.test(path);
           if (path.includes('..') || !(/^\/(items|taxes|units)(\/|\?|$)/.test(path) || estEdit || estStatus || (readOnly && meth === 'GET') || (meth === 'POST' && /^\/(individuals|companies|estimates)\/search(\?|$)/.test(path)))) throw new Error('Chemin non autorisé : ' + path);
