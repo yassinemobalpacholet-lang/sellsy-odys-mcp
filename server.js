@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -160,7 +160,7 @@ const safeUrl = u => /^https?:\/\//i.test(String(u || '')) ? String(u) : null;
 let mailer = null;
 function getMailer(env) {
   if (!env.SMTP_HOST || !env.SMTP_USER || !env.SMTP_PASS)
-    throw new Error("Envoi d'e-mail non configuré : ajoutez SMTP_HOST, SMTP_USER et SMTP_PASS dans les variables Railway");
+    throw new Error("Envoi d'e-mail non configuré : ajoutez BREVO_API_KEY (ou SMTP_HOST, SMTP_USER, SMTP_PASS) dans les variables Railway");
   if (!mailer) {
     const port = Number(env.SMTP_PORT || 465);
     mailer = nodemailer.createTransport({ host: env.SMTP_HOST, port, secure: port === 465, auth: { user: env.SMTP_USER, pass: env.SMTP_PASS },
@@ -180,10 +180,23 @@ async function sendEstimateEmail(env, { to, name, est, items }) {
 <p>Veuillez trouver votre devis <b>${esc(est.number || est.id)}</b>${est.subject ? ' (' + esc(est.subject) + ')' : ''}${lien ? ` : <a href="${esc(lien)}">consulter le devis</a>` : ''}.</p>
 ${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse"><tr style="background:#f2f2f2"><th>Article</th><th>Qté</th><th>Fiche technique</th></tr>${lines}</table>` : ''}
 <p>Cordialement,<br><b>ENERGETIK FRANCE</b><br>02 40 45 79 33 · <a href="mailto:contact@energetikfrance.fr">contact@energetikfrance.fr</a></p>`;
-  const info = await getMailer(env).sendMail({
-    from: env.FROM_EMAIL || env.SMTP_USER, to,
-    subject: 'Votre devis ENERGETIK FRANCE ' + (est.number || ''), html,
-  });
+  const subject = 'Votre devis ENERGETIK FRANCE ' + (est.number || '');
+  const from = env.FROM_EMAIL || env.SMTP_USER || 'contact@energetikfrance.fr';
+  if (env.BREVO_API_KEY) {
+    // Envoi par l'API HTTPS de Brevo (le SMTP est bloqué sur les offres Railway hors Pro)
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 15000);
+    try {
+      const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', signal: ctl.signal,
+        headers: { 'api-key': env.BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ sender: { name: env.FROM_NAME || 'ENERGETIK FRANCE', email: from }, to: [{ email: to, name: name || undefined }], subject, htmlContent: html }),
+      });
+      const txt = await r.text();
+      if (!r.ok) throw new Error('Brevo ' + r.status + ' : ' + txt.slice(0, 300));
+      return (JSON.parse(txt || '{}').messageId) || 'brevo';
+    } finally { clearTimeout(t); }
+  }
+  const info = await getMailer(env).sendMail({ from, to, subject, html });
   return info.messageId;
 }
 
