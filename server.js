@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.6.0';
+const VERSION = '2.7.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -49,10 +49,27 @@ const TOOLS = [{
       client_name: { type: 'string' },
       items: { type: 'array', description: 'Lignes [{nom, qte, pu, fiche_technique}]', items: { type: 'object' } },
       attachments: { type: 'array', description: 'Pièces jointes [{name, content (base64)}] : PDF ou images, 10 Mo au total', items: { type: 'object' } },
+      attachment_ids: { type: 'array', description: 'Identifiants de pièces jointes déposées par stage_attachment', items: { type: 'string' } },
+      subject: { type: 'string', description: "Objet de l'e-mail (sinon objet par défaut)" },
+      message: { type: 'string', description: "Texte de l'e-mail rédigé (texte brut, paragraphes séparés par une ligne vide). Le bouton vers le devis est ajouté sous le texte." },
+      include_items: { type: 'boolean', description: 'Ajouter le tableau des articles (défaut : oui si pas de message rédigé)' },
     },
     required: ['estimate_id', 'client_email'],
   },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+}, {
+  name: 'stage_attachment',
+  title: "Déposer une pièce jointe (par morceaux) avant l'envoi d'un devis",
+  description: "Dépose un morceau (base64, 300 Ko max) d'une pièce jointe. Envoyer les morceaux dans l'ordre (index 0..total-1) avec le même upload_id, puis passer upload_id dans attachment_ids de send_estimate. Conservé 1 heure.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      upload_id: { type: 'string' }, name: { type: 'string' },
+      index: { type: 'number' }, total: { type: 'number' }, chunk: { type: 'string' },
+    },
+    required: ['upload_id', 'name', 'index', 'total', 'chunk'],
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, {
   name: 'send_relance',
   title: 'Relancer le client sur son devis',
@@ -197,6 +214,26 @@ function getMailer(env) {
   }
   return mailer;
 }
+const STAGE = new Map(); // upload_id -> { name, total, parts[], at }
+function stagePut(a) {
+  const id = String(a.upload_id || ''); if (!/^[A-Za-z0-9_-]{6,64}$/.test(id)) throw new Error('upload_id invalide');
+  const total = Number(a.total), index = Number(a.index), chunk = String(a.chunk || '').replace(/\s+/g, '');
+  if (!(total >= 1 && total <= 60) || !(index >= 0 && index < total)) throw new Error('Découpage invalide');
+  if (!/^[A-Za-z0-9+/=]*$/.test(chunk) || chunk.length > 420000) throw new Error('Morceau invalide');
+  const now = Date.now(); for (const [k, v] of STAGE) if (now - v.at > 3600e3) STAGE.delete(k);
+  if (STAGE.size > 200) throw new Error('Trop de pièces jointes en attente');
+  let e = STAGE.get(id); if (!e || e.total !== total) { e = { name: String(a.name || 'document.pdf'), total, parts: new Array(total).fill(null), at: now }; STAGE.set(id, e); }
+  e.parts[index] = chunk; e.at = now;
+  const size = e.parts.reduce((t, p) => t + (p ? p.length : 0), 0); if (size * 0.75 > 10 * 1048576) { STAGE.delete(id); throw new Error('Pièce jointe trop lourde (10 Mo maximum)'); }
+  return { received: e.parts.filter(Boolean).length, total };
+}
+function stageGet(ids) {
+  return (Array.isArray(ids) ? ids : []).slice(0, 10).map(id => {
+    const e = STAGE.get(String(id)); if (!e) throw new Error('Pièce jointe introuvable ou expirée : ' + id);
+    if (e.parts.some(p => p === null)) throw new Error('Pièce jointe incomplète : ' + e.name);
+    return { name: e.name, content: e.parts.join('') };
+  });
+}
 function cleanAttachments(a) {
   if (!Array.isArray(a) || !a.length) return [];
   let tot = 0;
@@ -210,7 +247,7 @@ function cleanAttachments(a) {
   if (tot > 10 * 1024 * 1024) throw new Error('Pièces jointes trop lourdes (' + (tot / 1048576).toFixed(1) + ' Mo, 10 Mo maximum)');
   return out;
 }
-async function sendEstimateEmail(env, { to, name, est, items, attachments }) {
+async function sendEstimateEmail(env, { to, name, est, items, attachments, subject: subj, message, includeItems }) {
   if (!to) throw new Error('Adresse e-mail du client absente');
   const lines = (items || []).filter(r => r && r.type !== 'title').map(r => {
     const fiche = safeUrl(r.fiche_technique || r.datasheet_url);
@@ -218,12 +255,16 @@ async function sendEstimateEmail(env, { to, name, est, items, attachments }) {
       `<td>${fiche ? `<a href="${esc(fiche)}">Fiche technique</a>` : '—'}</td></tr>`;
   }).join('');
   const lien = safeUrl(est.public) || safeUrl(est.pdf);
-  const html = `<p>Bonjour${name ? ' ' + esc(name) : ''},</p>
+  const table = lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse"><tr style="background:#f2f2f2"><th>Article</th><th>Qté</th><th>Fiche technique</th></tr>${lines}</table>` : '';
+  const custom = String(message || '').trim();
+  const html = custom ? custom.split(/\n\s*\n/).map(p => '<p>' + esc(p.trim()).replace(/\n/g, '<br>') + '</p>').join('\n') +
+    (lien ? `\n<p>👉 <a href="${esc(lien)}"><b>Consulter et signer mon devis en ligne</b></a></p>` : '') + (includeItems ? '\n' + table : '')
+  : `<p>Bonjour${name ? ' ' + esc(name) : ''},</p>
 <p>Veuillez trouver votre devis <b>${esc(est.number || est.id)}</b>${est.subject ? ' (' + esc(est.subject) + ')' : ''}${lien ? ` : <a href="${esc(lien)}">consulter le devis</a>` : ''}.</p>
 ${(attachments || []).length ? `<p>Vous trouverez en pièces jointes : ${(attachments || []).map(x => esc(x.name.replace(/\.[a-z]+$/i, ''))).join(', ')}.</p>` : ''}
 ${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse"><tr style="background:#f2f2f2"><th>Article</th><th>Qté</th><th>Fiche technique</th></tr>${lines}</table>` : ''}
 <p>Cordialement,<br><b>ENERGETIK FRANCE</b><br>02 40 45 79 33 · <a href="mailto:contact@energetikfrance.fr">contact@energetikfrance.fr</a></p>`;
-  const subject = 'Votre devis ENERGETIK FRANCE ' + (est.number || '');
+  const subject = String(subj || '').trim().slice(0, 200) || ('Votre devis ENERGETIK FRANCE ' + (est.number || ''));
   const from = env.FROM_EMAIL || env.SMTP_USER || 'contact@energetikfrance.fr';
   if (env.BREVO_API_KEY) {
     // Envoi par l'API HTTPS de Brevo (le SMTP est bloqué sur les offres Railway hors Pro)
@@ -369,8 +410,14 @@ async function handle(env, m) {
         if (name === 'send_estimate') {
           const sy = new Sellsy(env);
           const est = summary(await sy.call('GET', '/estimates/' + Number(args.estimate_id)));
-          const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items, attachments: cleanAttachments(args.attachments) });
+          const att = cleanAttachments([...(args.attachments || []), ...stageGet(args.attachment_ids)]);
+          const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items, attachments: att, subject: args.subject, message: args.message, includeItems: args.include_items === undefined ? !args.message : !!args.include_items });
+          (args.attachment_ids || []).forEach(k => STAGE.delete(String(k)));
           return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + args.client_email }], structuredContent: { ok: true, number: est.number, messageId: id }, isError: false });
+        }
+        if (name === 'stage_attachment') {
+          const r = stagePut(args);
+          return ok(m.id, { content: [{ type: 'text', text: 'Morceau ' + (Number(args.index) + 1) + '/' + r.total + ' reçu' }], structuredContent: r, isError: false });
         }
         if (name === 'send_relance') {
           const est = summary(await new Sellsy(env).call('GET', '/estimates/' + Number(args.estimate_id)));
