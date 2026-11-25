@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.9.0';
+const VERSION = '2.10.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -50,6 +50,7 @@ const TOOLS = [{
       items: { type: 'array', description: 'Lignes [{nom, qte, pu, fiche_technique}]', items: { type: 'object' } },
       attachments: { type: 'array', description: 'Pièces jointes [{name, content (base64)}] : PDF ou images, 10 Mo au total', items: { type: 'object' } },
       attachment_ids: { type: 'array', description: 'Identifiants de pièces jointes déposées par stage_attachment', items: { type: 'string' } },
+      mark_sent: { type: 'boolean', description: "Passer le devis brouillon au statut « Envoyé » après l'envoi (défaut : oui ; non pour un envoi de test)" },
       attach_pdf: { type: 'boolean', description: 'Joindre le PDF du devis (défaut : oui)' },
       stage_chunk: { type: 'object', description: "Dépôt d'un morceau de pièce jointe {upload_id, name, index, total, chunk} : n'envoie rien" },
       to_emails: { type: 'array', description: 'Autres destinataires (en plus de client_email)', items: { type: 'string' } },
@@ -428,12 +429,8 @@ async function handle(env, m) {
           let att = cleanAttachments([...(args.attachments || []), ...stageGet(args.attachment_ids)]);
           const toMore = emailList(args.to_emails, 'destinataires'), bcc = emailList(args.bcc_emails, 'copie cachée');
           emailList([args.client_email], 'client');
-          let est = summary(await sy.call('GET', '/estimates/' + eid)), statusNote = '';
-          // Un devis en brouillon n'a pas de lien public valable : on le passe « envoyé » avant l'envoi
-          if (est.status === 'draft') {
-            try { await sy.call('PUT', '/estimates/' + eid + '/status', { status: 'sent' }); } catch (e) { statusNote = String(e && e.message || e).slice(0, 200); }
-            est = summary(await sy.call('GET', '/estimates/' + eid));
-          }
+          let est = summary(await sy.call('GET', '/estimates/' + eid));
+          const wasDraft = est.status === 'draft';
           // PDF du devis joint à l'e-mail (le lien de téléchargement Sellsy expire au bout de quelques minutes)
           if (args.attach_pdf !== false && est.pdf) {
             const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 20000);
@@ -447,9 +444,16 @@ async function handle(env, m) {
             finally { clearTimeout(tm); }
           }
           est.pdf = null; // jamais de lien de téléchargement temporaire dans l'e-mail
+          if (wasDraft && args.mark_sent === false) est.public = null; // envoi de test : le lien client ne s'ouvre pas tant que le devis est brouillon
           const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items, attachments: att, toMore, bcc, subject: args.subject, message: args.message, includeItems: args.include_items === undefined ? !args.message : !!args.include_items });
           (args.attachment_ids || []).forEach(k => STAGE.delete(String(k)));
-          return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + [args.client_email, ...toMore].join(', ') + (bcc.length ? ' (Cci : ' + bcc.join(', ') + ')' : '') }], structuredContent: { ok: true, number: est.number, messageId: id, to: [args.client_email, ...toMore], bcc }, isError: false });
+          // Une fois l'e-mail parti, le devis brouillon passe au statut « Envoyé » dans Sellsy (sauf envoi de test)
+          let statut = est.status, statutErreur = '';
+          if (wasDraft && args.mark_sent !== false) {
+            try { await sy.call('PUT', '/estimates/' + eid + '/status', { status: 'sent' }); statut = 'sent'; }
+            catch (e) { statutErreur = String(e && e.message || e).slice(0, 200); }
+          }
+          return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + [args.client_email, ...toMore].join(', ') + (bcc.length ? ' (Cci : ' + bcc.join(', ') + ')' : '') }], structuredContent: { ok: true, number: est.number, messageId: id, to: [args.client_email, ...toMore], bcc, status: statut, statusError: statutErreur }, isError: false });
         }
         if (name === 'stage_attachment') {
           const r = stagePut(args);
