@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.7.0';
+const VERSION = '2.8.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -50,6 +50,8 @@ const TOOLS = [{
       items: { type: 'array', description: 'Lignes [{nom, qte, pu, fiche_technique}]', items: { type: 'object' } },
       attachments: { type: 'array', description: 'Pièces jointes [{name, content (base64)}] : PDF ou images, 10 Mo au total', items: { type: 'object' } },
       attachment_ids: { type: 'array', description: 'Identifiants de pièces jointes déposées par stage_attachment', items: { type: 'string' } },
+      to_emails: { type: 'array', description: 'Autres destinataires (en plus de client_email)', items: { type: 'string' } },
+      bcc_emails: { type: 'array', description: 'Destinataires en copie cachée', items: { type: 'string' } },
       subject: { type: 'string', description: "Objet de l'e-mail (sinon objet par défaut)" },
       message: { type: 'string', description: "Texte de l'e-mail rédigé (texte brut, paragraphes séparés par une ligne vide). Le bouton vers le devis est ajouté sous le texte." },
       include_items: { type: 'boolean', description: 'Ajouter le tableau des articles (défaut : oui si pas de message rédigé)' },
@@ -247,7 +249,14 @@ function cleanAttachments(a) {
   if (tot > 10 * 1024 * 1024) throw new Error('Pièces jointes trop lourdes (' + (tot / 1048576).toFixed(1) + ' Mo, 10 Mo maximum)');
   return out;
 }
-async function sendEstimateEmail(env, { to, name, est, items, attachments, subject: subj, message, includeItems }) {
+const EMAIL_RE = /^[^@\s<>"',;]+@[^@\s<>"',;]+\.[^@\s<>"',;]+$/;
+function emailList(v, label) {
+  const a = (Array.isArray(v) ? v : String(v || '').split(/[,;\s]+/)).map(x => String(x || '').trim()).filter(Boolean);
+  a.forEach(x => { if (!EMAIL_RE.test(x)) throw new Error('Adresse e-mail invalide (' + label + ') : ' + x); });
+  if (a.length > 10) throw new Error('10 adresses maximum (' + label + ')');
+  return [...new Set(a.map(x => x.toLowerCase()))];
+}
+async function sendEstimateEmail(env, { to, name, est, items, attachments, subject: subj, message, includeItems, toMore, bcc }) {
   if (!to) throw new Error('Adresse e-mail du client absente');
   const lines = (items || []).filter(r => r && r.type !== 'title').map(r => {
     const fiche = safeUrl(r.fiche_technique || r.datasheet_url);
@@ -273,14 +282,14 @@ ${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-colla
       const r = await fetch('https://api.brevo.com/v3/smtp/email', {
         method: 'POST', signal: ctl.signal,
         headers: { 'api-key': env.BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify(Object.assign({ sender: { name: env.FROM_NAME || 'ENERGETIK FRANCE', email: from }, replyTo: { email: from, name: 'ENERGETIK FRANCE' }, to: [{ email: to, name: name || undefined }], subject, htmlContent: html }, (attachments || []).length ? { attachment: attachments } : {})),
+        body: JSON.stringify(Object.assign({ sender: { name: env.FROM_NAME || 'ENERGETIK FRANCE', email: from }, replyTo: { email: from, name: 'ENERGETIK FRANCE' }, to: [{ email: to, name: name || undefined }, ...(toMore || []).filter(x => x !== String(to).toLowerCase()).map(email => ({ email }))], subject, htmlContent: html }, (bcc || []).length ? { bcc: bcc.map(email => ({ email })) } : {}, (attachments || []).length ? { attachment: attachments } : {})),
       });
       const txt = await r.text();
       if (!r.ok) throw new Error('Brevo ' + r.status + ' : ' + txt.slice(0, 300));
       return (JSON.parse(txt || '{}').messageId) || 'brevo';
     } finally { clearTimeout(t); }
   }
-  const info = await getMailer(env).sendMail({ from, to, subject, html, attachments: (attachments || []).map(x => ({ filename: x.name, content: Buffer.from(x.content, 'base64') })) });
+  const info = await getMailer(env).sendMail({ from, to: [to, ...(toMore || [])].join(', '), bcc: (bcc || []).join(', ') || undefined, subject, html, attachments: (attachments || []).map(x => ({ filename: x.name, content: Buffer.from(x.content, 'base64') })) });
   return info.messageId;
 }
 
@@ -411,9 +420,11 @@ async function handle(env, m) {
           const sy = new Sellsy(env);
           const est = summary(await sy.call('GET', '/estimates/' + Number(args.estimate_id)));
           const att = cleanAttachments([...(args.attachments || []), ...stageGet(args.attachment_ids)]);
-          const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items, attachments: att, subject: args.subject, message: args.message, includeItems: args.include_items === undefined ? !args.message : !!args.include_items });
+          const toMore = emailList(args.to_emails, 'destinataires'), bcc = emailList(args.bcc_emails, 'copie cachée');
+          emailList([args.client_email], 'client');
+          const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items, attachments: att, toMore, bcc, subject: args.subject, message: args.message, includeItems: args.include_items === undefined ? !args.message : !!args.include_items });
           (args.attachment_ids || []).forEach(k => STAGE.delete(String(k)));
-          return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + args.client_email }], structuredContent: { ok: true, number: est.number, messageId: id }, isError: false });
+          return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + [args.client_email, ...toMore].join(', ') + (bcc.length ? ' (Cci : ' + bcc.join(', ') + ')' : '') }], structuredContent: { ok: true, number: est.number, messageId: id, to: [args.client_email, ...toMore], bcc }, isError: false });
         }
         if (name === 'stage_attachment') {
           const r = stagePut(args);
