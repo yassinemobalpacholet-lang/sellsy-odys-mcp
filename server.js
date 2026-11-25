@@ -163,7 +163,8 @@ function getMailer(env) {
     throw new Error("Envoi d'e-mail non configuré : ajoutez SMTP_HOST, SMTP_USER et SMTP_PASS dans les variables Railway");
   if (!mailer) {
     const port = Number(env.SMTP_PORT || 465);
-    mailer = nodemailer.createTransport({ host: env.SMTP_HOST, port, secure: port === 465, auth: { user: env.SMTP_USER, pass: env.SMTP_PASS } });
+    mailer = nodemailer.createTransport({ host: env.SMTP_HOST, port, secure: port === 465, auth: { user: env.SMTP_USER, pass: env.SMTP_PASS },
+      connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 20000 });
   }
   return mailer;
 }
