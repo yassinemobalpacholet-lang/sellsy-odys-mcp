@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.8.0';
+const VERSION = '2.9.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -50,6 +50,8 @@ const TOOLS = [{
       items: { type: 'array', description: 'Lignes [{nom, qte, pu, fiche_technique}]', items: { type: 'object' } },
       attachments: { type: 'array', description: 'Pièces jointes [{name, content (base64)}] : PDF ou images, 10 Mo au total', items: { type: 'object' } },
       attachment_ids: { type: 'array', description: 'Identifiants de pièces jointes déposées par stage_attachment', items: { type: 'string' } },
+      attach_pdf: { type: 'boolean', description: 'Joindre le PDF du devis (défaut : oui)' },
+      stage_chunk: { type: 'object', description: "Dépôt d'un morceau de pièce jointe {upload_id, name, index, total, chunk} : n'envoie rien" },
       to_emails: { type: 'array', description: 'Autres destinataires (en plus de client_email)', items: { type: 'string' } },
       bcc_emails: { type: 'array', description: 'Destinataires en copie cachée', items: { type: 'string' } },
       subject: { type: 'string', description: "Objet de l'e-mail (sinon objet par défaut)" },
@@ -269,7 +271,7 @@ async function sendEstimateEmail(env, { to, name, est, items, attachments, subje
   const html = custom ? custom.split(/\n\s*\n/).map(p => '<p>' + esc(p.trim()).replace(/\n/g, '<br>') + '</p>').join('\n') +
     (lien ? `\n<p>👉 <a href="${esc(lien)}"><b>Consulter et signer mon devis en ligne</b></a></p>` : '') + (includeItems ? '\n' + table : '')
   : `<p>Bonjour${name ? ' ' + esc(name) : ''},</p>
-<p>Veuillez trouver votre devis <b>${esc(est.number || est.id)}</b>${est.subject ? ' (' + esc(est.subject) + ')' : ''}${lien ? ` : <a href="${esc(lien)}">consulter le devis</a>` : ''}.</p>
+<p>Veuillez trouver ci-joint votre devis <b>${esc(est.number || est.id)}</b>${est.subject ? ' (' + esc(est.subject) + ')' : ''}${lien ? ` (également consultable en ligne : <a href="${esc(lien)}">consulter le devis</a>)` : ''}.</p>
 ${(attachments || []).length ? `<p>Vous trouverez en pièces jointes : ${(attachments || []).map(x => esc(x.name.replace(/\.[a-z]+$/i, ''))).join(', ')}.</p>` : ''}
 ${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse"><tr style="background:#f2f2f2"><th>Article</th><th>Qté</th><th>Fiche technique</th></tr>${lines}</table>` : ''}
 <p>Cordialement,<br><b>ENERGETIK FRANCE</b><br>02 40 45 79 33 · <a href="mailto:contact@energetikfrance.fr">contact@energetikfrance.fr</a></p>`;
@@ -416,12 +418,35 @@ async function handle(env, m) {
           }
           return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + s.number + ' créé dans Sellsy : ' + s.ttc.toFixed(2) + ' € TTC' }], structuredContent: s, isError: false });
         }
+        if (name === 'send_estimate' && args.stage_chunk && typeof args.stage_chunk === 'object') {
+          // dépôt d'un morceau de pièce jointe via l'outil existant (les clients qui n'ont pas encore l'outil stage_attachment)
+          const r = stagePut(args.stage_chunk);
+          return ok(m.id, { content: [{ type: 'text', text: 'Morceau ' + (Number(args.stage_chunk.index) + 1) + '/' + r.total + ' reçu (rien n\'a été envoyé)' }], structuredContent: Object.assign({ staged: true }, r), isError: false });
+        }
         if (name === 'send_estimate') {
-          const sy = new Sellsy(env);
-          const est = summary(await sy.call('GET', '/estimates/' + Number(args.estimate_id)));
-          const att = cleanAttachments([...(args.attachments || []), ...stageGet(args.attachment_ids)]);
+          const sy = new Sellsy(env), eid = Number(args.estimate_id);
+          let att = cleanAttachments([...(args.attachments || []), ...stageGet(args.attachment_ids)]);
           const toMore = emailList(args.to_emails, 'destinataires'), bcc = emailList(args.bcc_emails, 'copie cachée');
           emailList([args.client_email], 'client');
+          let est = summary(await sy.call('GET', '/estimates/' + eid)), statusNote = '';
+          // Un devis en brouillon n'a pas de lien public valable : on le passe « envoyé » avant l'envoi
+          if (est.status === 'draft') {
+            try { await sy.call('PUT', '/estimates/' + eid + '/status', { status: 'sent' }); } catch (e) { statusNote = String(e && e.message || e).slice(0, 200); }
+            est = summary(await sy.call('GET', '/estimates/' + eid));
+          }
+          // PDF du devis joint à l'e-mail (le lien de téléchargement Sellsy expire au bout de quelques minutes)
+          if (args.attach_pdf !== false && est.pdf) {
+            const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 20000);
+            try {
+              const r = await fetch(est.pdf, { signal: ctl.signal });
+              if (!r.ok) throw new Error('HTTP ' + r.status);
+              const buf = Buffer.from(await r.arrayBuffer());
+              if (buf.length < 100 || buf.slice(0, 4).toString() !== '%PDF') throw new Error('fichier reçu non PDF');
+              att.unshift({ name: 'Devis ' + String(est.number || eid).replace(/[\\/:*?"<>|]+/g, '_') + '.pdf', content: buf.toString('base64') });
+            } catch (e) { throw new Error('PDF du devis ' + est.number + ' introuvable dans Sellsy (' + String(e && e.message || e).slice(0, 120) + ') : rien n\'a été envoyé'); }
+            finally { clearTimeout(tm); }
+          }
+          est.pdf = null; // jamais de lien de téléchargement temporaire dans l'e-mail
           const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items, attachments: att, toMore, bcc, subject: args.subject, message: args.message, includeItems: args.include_items === undefined ? !args.message : !!args.include_items });
           (args.attachment_ids || []).forEach(k => STAGE.delete(String(k)));
           return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + [args.client_email, ...toMore].join(', ') + (bcc.length ? ' (Cci : ' + bcc.join(', ') + ')' : '') }], structuredContent: { ok: true, number: est.number, messageId: id, to: [args.client_email, ...toMore], bcc }, isError: false });
@@ -443,7 +468,8 @@ async function handle(env, m) {
           if (!['GET', 'POST', 'PUT', 'PATCH'].includes(meth)) throw new Error('Méthode non autorisée');
           const readOnly = /^\/(individuals|companies|contacts|estimates|search)(\/|\?|$)/.test(path);
           const estEdit = (meth === 'PUT' || meth === 'PATCH') && /^\/estimates\/\d+$/.test(path);
-          if (path.includes('..') || !(/^\/(items|taxes|units)(\/|\?|$)/.test(path) || estEdit || (readOnly && meth === 'GET') || (meth === 'POST' && /^\/(individuals|companies|estimates)\/search(\?|$)/.test(path)))) throw new Error('Chemin non autorisé : ' + path);
+          const estStatus = meth === 'PUT' && /^\/estimates\/\d+\/status$/.test(path);
+          if (path.includes('..') || !(/^\/(items|taxes|units)(\/|\?|$)/.test(path) || estEdit || estStatus || (readOnly && meth === 'GET') || (meth === 'POST' && /^\/(individuals|companies|estimates)\/search(\?|$)/.test(path)))) throw new Error('Chemin non autorisé : ' + path);
           if (estEdit) { const cur = await new Sellsy(env).call('GET', path); if (cur.status !== 'draft') throw new Error('Seul un devis en brouillon peut être modifié (statut : ' + cur.status + ')'); }
           const r = await new Sellsy(env).call(meth, path, meth === 'GET' ? undefined : (args.body || {}));
           return ok(m.id, { content: [{ type: 'text', text: JSON.stringify(r).slice(0, 60000) }], structuredContent: r, isError: false });
