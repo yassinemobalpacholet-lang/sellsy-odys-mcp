@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.12.0';
+const VERSION = '2.13.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -50,6 +50,7 @@ const TOOLS = [{
       items: { type: 'array', description: 'Lignes [{nom, qte, pu, fiche_technique}]', items: { type: 'object' } },
       attachments: { type: 'array', description: 'Pièces jointes [{name, content (base64)}] : PDF ou images, 10 Mo au total', items: { type: 'object' } },
       attachment_ids: { type: 'array', description: 'Identifiants de pièces jointes déposées par stage_attachment', items: { type: 'string' } },
+      attachment_urls: { type: 'array', description: 'Fiches techniques à joindre depuis le site du fabricant [{name, url}] (PDF)', items: { type: 'object' } },
       mark_sent: { type: 'boolean', description: "Passer le devis brouillon au statut « Envoyé » après l'envoi (défaut : oui ; non pour un envoi de test)" },
       attach_pdf: { type: 'boolean', description: 'Joindre le PDF du devis (défaut : oui)' },
       stage_chunk: { type: 'object', description: "Dépôt d'un morceau de pièce jointe {upload_id, name, index, total, chunk} : n'envoie rien" },
@@ -240,6 +241,24 @@ function stageGet(ids) {
     return { name: e.name, content: e.parts.join('') };
   });
 }
+async function fetchUrlAttachments(list) {
+  const out = [], skipped = [];
+  for (const x of (Array.isArray(list) ? list : []).slice(0, 8)) {
+    const url = safeUrl(x && x.url), name0 = String((x && x.name) || 'Fiche technique').replace(/[\\/:*?"<>|\r\n]+/g, '_').slice(0, 110);
+    if (!url) { skipped.push(name0 + ' (lien invalide)'); continue; }
+    const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 25000);
+    try {
+      const r = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36', Accept: 'application/pdf,*/*' } });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.slice(0, 4).toString() !== '%PDF') throw new Error('pas un PDF');
+      if (buf.length > 8 * 1048576) throw new Error('fichier de ' + (buf.length / 1048576).toFixed(1) + ' Mo, trop lourd');
+      out.push({ name: /\.pdf$/i.test(name0) ? name0 : name0 + '.pdf', content: buf.toString('base64') });
+    } catch (e) { skipped.push(name0 + ' (' + String(e && e.name === 'AbortError' ? 'délai dépassé' : (e && e.message) || e).slice(0, 60) + ')'); }
+    finally { clearTimeout(tm); }
+  }
+  return { out, skipped };
+}
 function cleanAttachments(a) {
   if (!Array.isArray(a) || !a.length) return [];
   let tot = 0;
@@ -250,7 +269,7 @@ function cleanAttachments(a) {
     if (!content || !/^[A-Za-z0-9+/=]+$/.test(content)) throw new Error('Pièce jointe illisible : ' + name);
     tot += content.length * 0.75; return { name, content };
   });
-  if (tot > 10 * 1024 * 1024) throw new Error('Pièces jointes trop lourdes (' + (tot / 1048576).toFixed(1) + ' Mo, 10 Mo maximum)');
+  if (tot > 15 * 1024 * 1024) throw new Error('Pièces jointes trop lourdes (' + (tot / 1048576).toFixed(1) + ' Mo, 15 Mo maximum)');
   return out;
 }
 const EMAIL_RE = /^[^@\s<>"',;]+@[^@\s<>"',;]+\.[^@\s<>"',;]+$/;
@@ -443,7 +462,8 @@ async function handle(env, m) {
         }
         if (name === 'send_estimate') {
           const sy = new Sellsy(env), eid = Number(args.estimate_id);
-          let att = cleanAttachments([...(args.attachments || []), ...stageGet(args.attachment_ids)]);
+          const fu = await fetchUrlAttachments(args.attachment_urls);
+          let att = cleanAttachments([...(args.attachments || []), ...stageGet(args.attachment_ids), ...fu.out]);
           const toMore = emailList(args.to_emails, 'destinataires'), bcc = emailList(args.bcc_emails, 'copie cachée');
           emailList([args.client_email], 'client');
           let est = summary(await sy.call('GET', '/estimates/' + eid));
@@ -470,7 +490,7 @@ async function handle(env, m) {
             try { await sy.call('PUT', '/estimates/' + eid + '/status', { status: 'sent' }); statut = 'sent'; }
             catch (e) { statutErreur = String(e && e.message || e).slice(0, 200); }
           }
-          return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + [args.client_email, ...toMore].join(', ') + (bcc.length ? ' (Cci : ' + bcc.join(', ') + ')' : '') }], structuredContent: { ok: true, number: est.number, messageId: id, to: [args.client_email, ...toMore], bcc, status: statut, statusError: statutErreur }, isError: false });
+          return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + [args.client_email, ...toMore].join(', ') + (bcc.length ? ' (Cci : ' + bcc.join(', ') + ')' : '') }], structuredContent: { ok: true, number: est.number, messageId: id, to: [args.client_email, ...toMore], bcc, status: statut, statusError: statutErreur, attached: att.map(x => x.name), skipped: fu.skipped }, isError: false });
         }
         if (name === 'stage_attachment') {
           const r = stagePut(args);
