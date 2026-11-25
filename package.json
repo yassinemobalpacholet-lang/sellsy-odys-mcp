@@ -1,6 +1,6 @@
 {
   "name": "sellsy-odys-mcp",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "type": "module",
   "description": "Sellsy-Odys MCP Connector - Node.js Express server with proper MCP protocol support",
   "main": "server.js",
