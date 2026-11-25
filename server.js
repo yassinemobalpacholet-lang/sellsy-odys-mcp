@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.13.0';
+const VERSION = '2.14.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -94,11 +94,11 @@ const TOOLS = [{
 }, {
   name: 'catalog_api',
   title: 'Gérer le catalogue Sellsy',
-  description: "Lit ou modifie le catalogue Sellsy (articles, taxes, unités) : appel direct de l'API Sellsy V2 : catalogue (/items, /taxes, /units) en lecture et écriture, clients et devis en lecture seule, sans suppression.",
+  description: "Lit ou modifie le catalogue Sellsy (articles, taxes, unités) : appel direct de l'API Sellsy V2 : catalogue (/items, /taxes, /units) en lecture et écriture, clients et devis en lecture seule ; remises TTC (CEE, MaPrimeRénov') liables et déliables sur un devis.",
   inputSchema: {
     type: 'object',
     properties: {
-      method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH'] },
+      method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] },
       path: { type: 'string', description: 'Chemin API V2, ex. /items?limit=100 ou /items/123' },
       body: { type: 'object' },
     },
@@ -506,13 +506,16 @@ async function handle(env, m) {
         }
         if (name === 'catalog_api') {
           const meth = String(args.method || 'GET').toUpperCase(), path = String(args.path || '');
-          if (!['GET', 'POST', 'PUT', 'PATCH'].includes(meth)) throw new Error('Méthode non autorisée');
-          const readOnly = /^\/(individuals|companies|contacts|estimates|search|staffs)(\/|\?|$)/.test(path);
+          if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(meth)) throw new Error('Méthode non autorisée');
+          const readOnly = /^\/(individuals|companies|contacts|estimates|search|staffs|discount-incl-taxes)(\/|\?|$)/.test(path);
           const estEdit = (meth === 'PUT' || meth === 'PATCH') && /^\/estimates\/\d+$/.test(path);
           const estStatus = meth === 'PUT' && /^\/estimates\/\d+\/status$/.test(path);
-          if (path.includes('..') || !(/^\/(items|taxes|units)(\/|\?|$)/.test(path) || estEdit || estStatus || (readOnly && meth === 'GET') || (meth === 'POST' && /^\/(individuals|companies|estimates)\/search(\?|$)/.test(path)))) throw new Error('Chemin non autorisé : ' + path);
+          /* remises TTC (CEE, MaPrimeRénov') : liaison / déliaison sur un devis */
+          const estDisc = (meth === 'POST' || meth === 'DELETE') && /^\/estimates\/\d+\/discount-incl-taxes\/\d+$/.test(path);
+          if (meth === 'DELETE' && !estDisc) throw new Error('Suppression non autorisée : ' + path);
+          if (path.includes('..') || !(/^\/(items|taxes|units)(\/|\?|$)/.test(path) || estEdit || estStatus || estDisc || (readOnly && meth === 'GET') || (meth === 'POST' && /^\/(individuals|companies|estimates)\/search(\?|$)/.test(path)))) throw new Error('Chemin non autorisé : ' + path);
           if (estEdit) { const cur = await new Sellsy(env).call('GET', path); if (cur.status !== 'draft') throw new Error('Seul un devis en brouillon peut être modifié (statut : ' + cur.status + ')'); }
-          const r = await new Sellsy(env).call(meth, path, meth === 'GET' ? undefined : (args.body || {}));
+          const r = await new Sellsy(env).call(meth, path, (meth === 'GET' || meth === 'DELETE') ? undefined : (args.body || {}));
           return ok(m.id, { content: [{ type: 'text', text: JSON.stringify(r).slice(0, 60000) }], structuredContent: r, isError: false });
         }
         if (name === 'ping') {
