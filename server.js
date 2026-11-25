@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.4.0';
+const VERSION = '2.4.1';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -69,7 +69,7 @@ const TOOLS = [{
 }, {
   name: 'catalog_api',
   title: 'Gérer le catalogue Sellsy',
-  description: "Lit ou modifie le catalogue Sellsy (articles, taxes, unités) : appel direct de l'API Sellsy V2 limité aux chemins /items, /taxes et /units, sans suppression.",
+  description: "Lit ou modifie le catalogue Sellsy (articles, taxes, unités) : appel direct de l'API Sellsy V2 : catalogue (/items, /taxes, /units) en lecture et écriture, clients et devis en lecture seule, sans suppression.",
   inputSchema: {
     type: 'object',
     properties: {
@@ -343,7 +343,8 @@ async function handle(env, m) {
         if (name === 'catalog_api') {
           const meth = String(args.method || 'GET').toUpperCase(), path = String(args.path || '');
           if (!['GET', 'POST', 'PUT', 'PATCH'].includes(meth)) throw new Error('Méthode non autorisée');
-          if (!/^\/(items|taxes|units)(\/|\?|$)/.test(path) || path.includes('..')) throw new Error('Chemin non autorisé : ' + path);
+          const readOnly = /^\/(individuals|companies|contacts|estimates|search)(\/|\?|$)/.test(path);
+          if (path.includes('..') || !(/^\/(items|taxes|units)(\/|\?|$)/.test(path) || (readOnly && meth === 'GET') || (meth === 'POST' && /^\/(individuals|companies|estimates)\/search(\?|$)/.test(path)))) throw new Error('Chemin non autorisé : ' + path);
           const r = await new Sellsy(env).call(meth, path, meth === 'GET' ? undefined : (args.body || {}));
           return ok(m.id, { content: [{ type: 'text', text: JSON.stringify(r).slice(0, 60000) }], structuredContent: r, isError: false });
         }
