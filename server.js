@@ -38,7 +38,9 @@ const tools = [
             properties: {
               description: { type: 'string' },
               quantity: { type: 'number' },
-              unit_price: { type: 'number' }
+              unit_price: { type: 'number', description: 'Prix unitaire HT' },
+              tax_rate: { type: 'number', description: 'Taux de TVA en % (ex. 5.5, 10, 20). Défaut : DEFAULT_TAX_RATE ou 20' },
+              reference: { type: 'string', description: 'Référence article (optionnel)' }
             }
           },
           description: 'Line items for the estimate'
@@ -133,59 +135,95 @@ async function callSellsyAPI(method, endpoint, data = null) {
   return await response.json();
 }
 
-// Find or Create Client
+// Sellsy V2 : les créations renvoient l'objet directement, les listes/recherches renvoient { data: [...] }
+function unwrap(res) {
+  return res && res.data && !Array.isArray(res.data) ? res.data : res;
+}
+
+// Find or Create Client (particulier = "individual" dans Sellsy V2)
 async function findOrCreateClient(email, name) {
   log('Looking for client:', email);
 
   try {
-    // Search for existing client
-    const searchResponse = await callSellsyAPI('GET', `/contacts?search=${encodeURIComponent(email)}`);
-
-    if (searchResponse.data && searchResponse.data.length > 0) {
-      log('Found existing client:', searchResponse.data[0].id);
-      return searchResponse.data[0].id;
+    // Recherche d'un particulier existant par email
+    try {
+      const search = await callSellsyAPI('POST', '/individuals/search?limit=10', {
+        filters: { email }
+      });
+      const match = (search.data || []).find(
+        ind => (ind.email || '').toLowerCase() === email.toLowerCase()
+      );
+      if (match) {
+        log('Found existing client:', match.id);
+        return match.id;
+      }
+    } catch (searchError) {
+      log('Client search failed, will create a new one:', searchError.message);
     }
 
     log('Creating new client:', name);
+    const parts = name.trim().split(/\s+/);
+    const created = unwrap(await callSellsyAPI('POST', '/individuals', {
+      type: 'client',
+      first_name: parts.length > 1 ? parts[0] : '',
+      last_name: parts.length > 1 ? parts.slice(1).join(' ') : name,
+      email
+    }));
 
-    // Create new client
-    const createResponse = await callSellsyAPI('POST', '/contacts', {
-      firstname: name.split(' ')[0],
-      lastname: name.split(' ').slice(1).join(' ') || name,
-      email: email
-    });
-
-    log('Client created with ID:', createResponse.data.id);
-    return createResponse.data.id;
+    log('Client created with ID:', created.id);
+    return created.id;
   } catch (error) {
     log('ERROR in findOrCreateClient:', error.message);
     throw error;
   }
 }
 
-// Create Estimate
+// Taux de TVA -> tax_id Sellsy (obligatoire sur chaque ligne)
+let taxesCache = null;
+async function getTaxId(rate) {
+  if (!taxesCache) {
+    const res = await callSellsyAPI('GET', '/taxes?limit=100');
+    taxesCache = res.data || [];
+  }
+  const tax = taxesCache.find(t => Number(t.rate) === Number(rate) && t.is_active !== false);
+  if (!tax) {
+    const available = taxesCache.map(t => t.rate).join(', ');
+    throw new Error(`No Sellsy tax found for rate ${rate}% (available: ${available})`);
+  }
+  return tax.id;
+}
+
+const DEFAULT_TAX_RATE = Number(process.env.DEFAULT_TAX_RATE || 20);
+
+// Create Estimate (format Sellsy API V2)
 async function createEstimate(clientId, subject, items) {
   log('Creating estimate for client:', clientId);
 
   try {
-    const totalHT = items.reduce((sum, item) => sum + (item.quantity * item.unit_price), 0);
+    const rows = [];
+    for (const item of items) {
+      rows.push({
+        type: 'single',
+        reference: item.reference || undefined,
+        description: item.description || 'Article',
+        quantity: String(item.quantity ?? 1),
+        unit_amount: Number(item.unit_price ?? 0).toFixed(2),
+        tax_id: await getTaxId(item.tax_rate ?? DEFAULT_TAX_RATE)
+      });
+    }
 
     const estimateData = {
-      client_id: clientId,
-      subject: subject,
-      status: 'draft',
-      lié: null,
-      items: items.map(item => ({
-        description: item.description,
-        quantity: item.quantity,
-        unit_price: item.unit_price
-      }))
+      date: new Date().toISOString().slice(0, 10),
+      subject,
+      currency: 'EUR',
+      related: [{ id: clientId, type: 'individual' }],
+      rows
     };
 
     log('Estimate data to send:', JSON.stringify(estimateData));
-    const response = await callSellsyAPI('POST', '/estimates', estimateData);
-    log('Estimate created with ID:', response.data.id);
-    return response.data;
+    const estimate = unwrap(await callSellsyAPI('POST', '/estimates', estimateData));
+    log('Estimate created with ID:', estimate.id);
+    return estimate;
   } catch (error) {
     log('ERROR in createEstimate:', error.message);
     throw error;
@@ -261,7 +299,9 @@ async function handleMCPMessage(message) {
           items = jobRows.map(row => ({
             description: row.nom || row.name || 'Article',
             quantity: parseInt(row.qte) || row.quantity || 1,
-            unit_price: parseFloat(row.pu) || row.unit_price || 0
+            unit_price: parseFloat(row.pu) || row.unit_price || 0,
+            tax_rate: row.tva ?? row.tax_rate,
+            reference: row.ref || row.reference
           }));
         } else {
           // Direct parameter structure
