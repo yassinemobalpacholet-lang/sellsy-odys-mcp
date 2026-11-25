@@ -1,438 +1,265 @@
+/*
+ * Sellsy-Odys MCP — serveur Express pour Railway.
+ * Logique Sellsy reprise du connecteur d'Odys (outils/connecteur-sellsy.js) : mêmes outils, même format
+ * de réponse (structuredContent avec id, number, ht, ttc, pdf…) que celui attendu par Odys.
+ *
+ * Variables Railway : SELLSY_ID, SELLSY_SECRET, ODYS_KEY (longue et aléatoire), PORT (fourni par Railway).
+ * Adresse du connecteur : https://<domaine>/mcp/<ODYS_KEY>
+ */
 import express from 'express';
-import fetch from 'node-fetch';
+
+/*
+ * Connecteur Sellsy d'Odys (ENERGETIK FRANCE) — Cloudflare Worker, serveur MCP (HTTP « streamable », réponses JSON).
+ * Crée immédiatement un devis dans Sellsy à partir d'une demande d'Odys.
+ *
+ * Variables secrètes du Worker (Settings → Variables and Secrets, type « Secret ») :
+ *   SELLSY_ID      identifiant client de l'accès API Sellsy
+ *   SELLSY_SECRET  secret de l'accès API Sellsy
+ *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
+ */
+const API = 'https://api.sellsy.com/v2';
+const VERSION = '2.0.0';
+const PROTO = '2025-06-18';
+
+const TOOLS = [{
+  name: 'create_estimate',
+  title: 'Créer un devis Sellsy',
+  description: "Crée un devis dans Sellsy pour un dossier Odys : retrouve ou crée la fiche client, ajoute les lignes (articles du catalogue Sellsy ou lignes libres, titres de lots) et renvoie le numéro, les montants et les liens PDF du devis.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      job: {
+        type: 'object',
+        description: "Demande de devis Odys : client {sellsyId, sellsyType, forceNew, societe, civilite, nom, prenom, email, tel, adresse, cp, ville}, rows [{sellsyId, ref, nom, qte, pu, tva} ou {type:'title', text}], date, subject, note, tvaDefaut.",
+      },
+    },
+    required: ['job'],
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+}, {
+  name: 'ping',
+  title: 'Tester la connexion Sellsy',
+  description: "Vérifie que le connecteur joint Sellsy avec ses identifiants. Ne modifie rien.",
+  inputSchema: { type: 'object', properties: {} },
+  annotations: { readOnlyHint: true, openWorldHint: true },
+}];
+
+/* ---------- utilitaires ---------- */
+const norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+function phone(s) {
+  let d = String(s || '').replace(/\D/g, '');
+  if (d.startsWith('0') && d.length === 10) d = '33' + d.slice(1);
+  return d ? '+' + d : null;
+}
+const clean = o => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined && v !== ''));
+
+class Sellsy {
+  constructor(env) { this.env = env; this.token = null; this.taxes = null; }
+  async auth() {
+    if (this.token) return;
+    const r = await fetch('https://login.sellsy.com/oauth2/access-tokens', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'client_credentials', client_id: this.env.SELLSY_ID || '', client_secret: this.env.SELLSY_SECRET || '' }),
+    });
+    if (!r.ok) throw new Error('Identifiants Sellsy refusés (' + r.status + ') : ' + (await r.text()).slice(0, 300));
+    this.token = (await r.json()).access_token;
+  }
+  async call(method, path, body) {
+    await this.auth();
+    for (let k = 0; k < 3; k++) {
+      const r = await fetch(API + path, {
+        method, headers: { Authorization: 'Bearer ' + this.token, Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (r.status === 429 && k < 2) { await new Promise(res => setTimeout(res, 2000)); continue; }
+      const txt = await r.text();
+      if (!r.ok) throw new Error(method + ' ' + path + ' → ' + r.status + ' ' + txt.slice(0, 600));
+      return txt ? JSON.parse(txt) : {};
+    }
+  }
+  async taxId(rate, def) {
+    if (!this.taxes) {
+      this.taxes = {};
+      for (const t of (await this.call('GET', '/taxes?limit=100')).data || []) {
+        if (t.is_active) { const k = Number(t.rate).toFixed(1); if (!(k in this.taxes)) this.taxes[k] = t.id; }
+      }
+    }
+    const key = v => { const x = parseFloat(String(v ?? '').replace(',', '.').replace('%', '')); return isNaN(x) ? null : x.toFixed(1); };
+    const d = key(def) || '5.5';
+    return this.taxes[key(rate) || d] || this.taxes[d];
+  }
+  async search(q, type) {
+    const r = await this.call('GET', '/search?' + new URLSearchParams({ q, limit: '20' }) + '&type%5B%5D=' + type);
+    return r.data || [];
+  }
+  async address(kind, id, c) {
+    if (!c.adresse && !c.ville) return;
+    await this.call('POST', `/${kind}/${id}/addresses`, {
+      name: 'Adresse principale', address_line_1: c.adresse || '-', postal_code: c.cp || '', city: c.ville || '',
+      country_code: 'FR', is_invoicing_address: true, is_delivery_address: true,
+    });
+  }
+  /* retourne [id, type, créé ?] */
+  async client(c) {
+    if (c.sellsyId) return [Number(c.sellsyId), c.sellsyType || 'individual', false];
+    if (c.societe) {
+      if (!c.forceNew) {
+        const k = norm(c.societe);
+        for (const h of await this.search(c.societe, 'company')) {
+          const o = h.object || {};
+          if (o.type === 'company' && norm(h.name || h.company_name) === k) return [o.id, 'company', false];
+        }
+      }
+      const co = await this.call('POST', '/companies', clean({ type: 'prospect', name: c.societe, email: c.email, phone_number: phone(c.tel) }));
+      await this.address('companies', co.id, c);
+      return [co.id, 'company', true];
+    }
+    if (!c.forceNew) {
+      if (c.email) {
+        const r = await this.call('POST', '/individuals/search?limit=5', { filters: { email: c.email } });
+        if (r.data && r.data.length) return [r.data[0].id, 'individual', false];
+      }
+      if (c.nom) {
+        const mob = phone(c.tel);
+        for (const h of await this.search(c.nom, 'individual')) {
+          const o = h.object || {};
+          const sameName = norm(h.last_name) === norm(c.nom) && (!c.prenom || norm(h.first_name) === norm(c.prenom));
+          const sameTel = mob && phone(h.mobile_number || h.phone_number) === mob;
+          if (o.type === 'individual' && sameName && (sameTel || !mob)) return [o.id, 'individual', false];
+        }
+      }
+    }
+    const ind = await this.call('POST', '/individuals', clean({
+      type: 'prospect', last_name: c.nom || 'Client', first_name: c.prenom,
+      civility: String(c.civilite || '').startsWith('Mme') ? 'mrs' : 'mr', email: c.email, mobile_number: phone(c.tel),
+    }));
+    await this.address('individuals', ind.id, c);
+    return [ind.id, 'individual', true];
+  }
+}
+
+function summary(e) {
+  const a = e.amounts || {}, rel = (e.related || [])[0] || {}, pl = e.public_link;
+  return {
+    id: e.id, number: e.number, status: e.status, date: e.date,
+    ht: Number(a.total_excl_tax || 0), ttc: Number(a.total || a.total_incl_tax || 0), name: e.company_name || '',
+    relType: rel.type, relId: rel.id, pdf: e.pdf_link || null,
+    public: pl && typeof pl === 'object' ? (pl.enabled ? pl.url : null) : (pl || null), subject: e.subject || '',
+  };
+}
+
+async function createEstimate(env, job) {
+  if (!job || typeof job !== 'object') throw new Error('Demande de devis absente');
+  const rows0 = Array.isArray(job.rows) ? job.rows : [];
+  if (!rows0.some(r => r && r.type !== 'title')) throw new Error('Aucune ligne de devis');
+  const sy = new Sellsy(env);
+  const [cid, ctype, created] = await sy.client(job.client || {});
+  const rows = [];
+  for (const r of rows0) {
+    if (r.type === 'title') { rows.push({ type: 'title', text: r.text || '' }); continue; }
+    const row = { quantity: String(r.qte || 1), unit_amount: Number(r.pu || 0).toFixed(2), tax_id: await sy.taxId(r.tva, job.tvaDefaut || '5.5') };
+    if (r.sellsyId) Object.assign(row, { type: 'catalog', related: { type: 'product', id: Number(r.sellsyId) } });
+    else Object.assign(row, clean({ type: 'single', reference: String(r.ref || '').slice(0, 100), description: r.nom || '' }));
+    rows.push(row);
+  }
+  const body = {
+    date: job.date || new Date().toISOString().slice(0, 10), subject: job.subject || '', note: job.note || '',
+    currency: 'EUR', related: [{ type: ctype, id: cid }], rows,
+  };
+  const e0 = await sy.call('POST', '/estimates', body);
+  const e = await sy.call('GET', '/estimates/' + e0.id);
+  return Object.assign(summary(e), { clientId: cid, clientType: ctype, clientCree: created });
+}
+
+/* ---------- MCP (JSON-RPC 2.0 sur HTTP) ---------- */
+const ok = (id, result) => ({ jsonrpc: '2.0', id, result });
+const err = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
+
+async function handle(env, m) {
+  if (!m || m.jsonrpc !== '2.0' || typeof m.method !== 'string') return err(m && m.id !== undefined ? m.id : null, -32600, 'Requête invalide');
+  const isNotif = m.id === undefined || m.id === null;
+  switch (m.method) {
+    case 'initialize':
+      return ok(m.id, {
+        protocolVersion: (m.params && m.params.protocolVersion) || PROTO,
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: 'sellsy-odys', title: 'Sellsy Odys', version: VERSION },
+        instructions: "Connecteur Sellsy d'Odys (ENERGETIK FRANCE) : création immédiate des devis.",
+      });
+    case 'ping': return isNotif ? null : ok(m.id, {});
+    case 'tools/list': return ok(m.id, { tools: TOOLS });
+    case 'tools/call': {
+      const name = m.params && m.params.name, args = (m.params && m.params.arguments) || {};
+      try {
+        if (name === 'create_estimate') {
+          const s = await createEstimate(env, args.job);
+          return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + s.number + ' créé dans Sellsy : ' + s.ttc.toFixed(2) + ' € TTC' }], structuredContent: s, isError: false });
+        }
+        if (name === 'ping') {
+          const sy = new Sellsy(env); await sy.auth();
+          return ok(m.id, { content: [{ type: 'text', text: 'Connexion Sellsy OK' }], structuredContent: { ok: true }, isError: false });
+        }
+        return err(m.id, -32602, 'Outil inconnu : ' + name);
+      } catch (e) {
+        return ok(m.id, { content: [{ type: 'text', text: String(e && e.message || e).slice(0, 900) }], isError: true });
+      }
+    }
+    default:
+      if (isNotif) return null; // notifications/initialized, notifications/cancelled…
+      return err(m.id, -32601, 'Méthode inconnue : ' + m.method);
+  }
+}
+
+function safeEq(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let d = 0; for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+
+/* ---------- Serveur HTTP (Express) ---------- */
+const env = process.env;
+const PORT = env.PORT || 8080;
+const log = (...a) => console.log('[' + new Date().toISOString() + ']', ...a);
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+app.use(express.json({ limit: '2mb' }));
 
-const SELLSY_ID = process.env.SELLSY_ID || 'default-id';
-const SELLSY_SECRET = process.env.SELLSY_SECRET || 'default-secret';
-const ODYS_KEY = process.env.ODYS_KEY || 'default-key';
+app.get('/', (req, res) => res.json({ service: 'Sellsy-Odys-MCP', version: VERSION }));
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-let tokenCache = {
-  access_token: null,
-  expires_at: 0
-};
+const keyOk = req => !!env.ODYS_KEY && safeEq(req.params.key || '', env.ODYS_KEY);
 
-// Logging helper
-function log(message, data = '') {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${message}`, data);
-}
-
-app.use(express.json());
-
-// MCP Protocol Implementation
-const tools = [
-  {
-    name: 'create_estimate',
-    description: 'Create an estimate (devis) in Sellsy CRM',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        client_email: { type: 'string', description: 'Email of the client' },
-        client_name: { type: 'string', description: 'Name of the client' },
-        items: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              description: { type: 'string' },
-              quantity: { type: 'number' },
-              unit_price: { type: 'number', description: 'Prix unitaire HT' },
-              tax_rate: { type: 'number', description: 'Taux de TVA en % (ex. 5.5, 10, 20). Défaut : DEFAULT_TAX_RATE ou 20' },
-              reference: { type: 'string', description: 'Référence article (optionnel)' }
-            }
-          },
-          description: 'Line items for the estimate'
-        },
-        subject: { type: 'string', description: 'Subject/title of the estimate' }
-      },
-      required: ['client_email', 'client_name', 'items', 'subject']
-    }
-  },
-  {
-    name: 'ping',
-    description: 'Test connection to Sellsy'
-  }
-];
-
-// Get Sellsy OAuth2 Token
-async function getSellsyToken() {
-  log('Checking token cache...');
-
-  if (tokenCache.access_token && Date.now() < tokenCache.expires_at) {
-    log('Using cached token, expires in', Math.round((tokenCache.expires_at - Date.now()) / 1000) + 's');
-    return tokenCache.access_token;
-  }
-
-  log('Requesting new token from Sellsy OAuth2');
-  log('Using credentials:', `ID=${SELLSY_ID.substring(0, 8)}...`);
-
-  const tokenUrl = 'https://login.sellsy.com/oauth2/access-tokens';
-
+app.all('/mcp/:key', async (req, res) => {
+  if (!keyOk(req)) return res.status(404).send('Not found');
+  if (req.method !== 'POST') return res.status(405).set('Allow', 'POST').end();
+  const body = req.body;
+  if (!body || typeof body !== 'object') return res.status(400).json(err(null, -32700, 'JSON invalide'));
   try {
-    const response = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body: new URLSearchParams({
-        grant_type: 'client_credentials',
-        client_id: SELLSY_ID,
-        client_secret: SELLSY_SECRET
-      }).toString()
-    });
-
-    log('Token response status:', response.status);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      log('Token error response:', errorText.substring(0, 500));
-      throw new Error(`Sellsy token error: ${response.status} ${response.statusText} - ${errorText.substring(0, 200)}`);
+    if (Array.isArray(body)) {
+      const out = (await Promise.all(body.map(x => handle(env, x)))).filter(Boolean);
+      return out.length ? res.json(out) : res.status(202).end();
     }
-
-    const data = await response.json();
-    log('Token obtained successfully, expires in', data.expires_in + 's');
-
-    tokenCache = {
-      access_token: data.access_token,
-      expires_at: Date.now() + (data.expires_in || 3600) * 1000
-    };
-
-    return data.access_token;
-  } catch (error) {
-    log('ERROR in getSellsyToken:', error.message);
-    throw error;
-  }
-}
-
-// Call Sellsy API
-async function callSellsyAPI(method, endpoint, data = null) {
-  log(`Calling Sellsy API: ${method} ${endpoint}`);
-
-  const token = await getSellsyToken();
-
-  const options = {
-    method,
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json'
-    }
-  };
-
-  if (data) {
-    options.body = JSON.stringify(data);
-  }
-
-  const response = await fetch(`https://api.sellsy.com/v2${endpoint}`, options);
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    log(`API error ${response.status}:`, errorText.substring(0, 500));
-    throw new Error(`Sellsy API error: ${response.status} - ${errorText.substring(0, 200)}`);
-  }
-
-  return await response.json();
-}
-
-// Sellsy V2 : les créations renvoient l'objet directement, les listes/recherches renvoient { data: [...] }
-function unwrap(res) {
-  return res && res.data && !Array.isArray(res.data) ? res.data : res;
-}
-
-// Find or Create Client (particulier = "individual" dans Sellsy V2)
-async function findOrCreateClient(email, name) {
-  log('Looking for client:', email);
-
-  try {
-    // Recherche d'un particulier existant par email
-    try {
-      const search = await callSellsyAPI('POST', '/individuals/search?limit=10', {
-        filters: { email }
-      });
-      const match = (search.data || []).find(
-        ind => (ind.email || '').toLowerCase() === email.toLowerCase()
-      );
-      if (match) {
-        log('Found existing client:', match.id);
-        return match.id;
-      }
-    } catch (searchError) {
-      log('Client search failed, will create a new one:', searchError.message);
-    }
-
-    log('Creating new client:', name);
-    const parts = name.trim().split(/\s+/);
-    const created = unwrap(await callSellsyAPI('POST', '/individuals', {
-      type: 'client',
-      first_name: parts.length > 1 ? parts[0] : '',
-      last_name: parts.length > 1 ? parts.slice(1).join(' ') : name,
-      email
-    }));
-
-    log('Client created with ID:', created.id);
-    return created.id;
-  } catch (error) {
-    log('ERROR in findOrCreateClient:', error.message);
-    throw error;
-  }
-}
-
-// Taux de TVA -> tax_id Sellsy (obligatoire sur chaque ligne)
-let taxesCache = null;
-async function getTaxId(rate) {
-  if (!taxesCache) {
-    const res = await callSellsyAPI('GET', '/taxes?limit=100');
-    taxesCache = res.data || [];
-  }
-  const tax = taxesCache.find(t => Number(t.rate) === Number(rate) && t.is_active !== false);
-  if (!tax) {
-    const available = taxesCache.map(t => t.rate).join(', ');
-    throw new Error(`No Sellsy tax found for rate ${rate}% (available: ${available})`);
-  }
-  return tax.id;
-}
-
-const DEFAULT_TAX_RATE = Number(process.env.DEFAULT_TAX_RATE || 20);
-
-// Create Estimate (format Sellsy API V2)
-async function createEstimate(clientId, subject, items) {
-  log('Creating estimate for client:', clientId);
-
-  try {
-    const rows = [];
-    for (const item of items) {
-      rows.push({
-        type: 'single',
-        reference: item.reference || undefined,
-        description: item.description || 'Article',
-        quantity: String(item.quantity ?? 1),
-        unit_amount: Number(item.unit_price ?? 0).toFixed(2),
-        tax_id: await getTaxId(item.tax_rate ?? DEFAULT_TAX_RATE)
-      });
-    }
-
-    const estimateData = {
-      date: new Date().toISOString().slice(0, 10),
-      subject,
-      currency: 'EUR',
-      related: [{ id: clientId, type: 'individual' }],
-      rows
-    };
-
-    log('Estimate data to send:', JSON.stringify(estimateData));
-    const estimate = unwrap(await callSellsyAPI('POST', '/estimates', estimateData));
-    log('Estimate created with ID:', estimate.id);
-    return estimate;
-  } catch (error) {
-    log('ERROR in createEstimate:', error.message);
-    throw error;
-  }
-}
-
-// MCP Message Handler
-async function handleMCPMessage(message) {
-  log('Handling MCP message:', message.method);
-
-  const { method, params } = message;
-
-  if (method === 'initialize') {
-    return {
-      jsonrpc: '2.0',
-      result: {
-        protocolVersion: '2024-11-05',
-        capabilities: {
-          tools: {}
-        },
-        serverInfo: {
-          name: 'Sellsy-Odys-MCP',
-          version: '1.0.0'
-        }
-      },
-      id: message.id
-    };
-  }
-
-  if (method === 'tools/list') {
-    return {
-      jsonrpc: '2.0',
-      result: { tools },
-      id: message.id
-    };
-  }
-
-  if (method === 'tools/call') {
-    const { name, arguments: args } = params;
-    log('Calling tool:', name);
-    log('Tool arguments:', JSON.stringify(args));
-
-    if (name === 'ping') {
-      return {
-        jsonrpc: '2.0',
-        result: {
-          content: [
-            {
-              type: 'text',
-              text: 'Sellsy-Odys-MCP server is running!'
-            }
-          ]
-        },
-        id: message.id
-      };
-    }
-
-    if (name === 'create_estimate') {
-      try {
-        // Support both Odys structure and direct structure
-        let client_email, client_name, items, subject;
-
-        // Check if args has job structure (Odys format)
-        if (args.job && args.job.client) {
-          const jobClient = args.job.client;
-          const jobRows = args.job.rows || [];
-
-          client_email = jobClient.email;
-          client_name = `${jobClient.prenom} ${jobClient.nom}`;
-          subject = jobClient.subject || `Devis ${jobClient.nom}`;
-
-          // Map rows to items (rows can be at job.rows or job.client.rows)
-          items = jobRows.map(row => ({
-            description: row.nom || row.name || 'Article',
-            quantity: parseInt(row.qte) || row.quantity || 1,
-            unit_price: parseFloat(row.pu) || row.unit_price || 0,
-            tax_rate: row.tva ?? row.tax_rate,
-            reference: row.ref || row.reference
-          }));
-        } else {
-          // Direct parameter structure
-          ({ client_email, client_name, items, subject } = args || {});
-        }
-
-        // Validation des paramètres requis
-        if (!client_email) {
-          throw new Error('Missing required parameter: client_email');
-        }
-        if (!client_name) {
-          throw new Error('Missing required parameter: client_name');
-        }
-        if (!items || !Array.isArray(items) || items.length === 0) {
-          throw new Error('Missing or invalid parameter: items (must be non-empty array)');
-        }
-        if (!subject) {
-          throw new Error('Missing required parameter: subject');
-        }
-
-        log('create_estimate parameters valid:', { client_email, client_name, itemCount: items.length, subject });
-
-        const clientId = await findOrCreateClient(client_email, client_name);
-        const estimate = await createEstimate(clientId, subject, items);
-
-        return {
-          jsonrpc: '2.0',
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: `Estimate created successfully! ID: ${estimate.id}`
-              }
-            ]
-          },
-          id: message.id
-        };
-      } catch (error) {
-        log('ERROR in create_estimate tool:', error.message);
-        return {
-          jsonrpc: '2.0',
-          error: {
-            code: -32603,
-            message: `Error creating estimate: ${error.message}`
-          },
-          id: message.id
-        };
-      }
-    }
-
-    return {
-      jsonrpc: '2.0',
-      error: {
-        code: -32602,
-        message: `Unknown tool: ${name}`
-      },
-      id: message.id
-    };
-  }
-
-  return {
-    jsonrpc: '2.0',
-    error: {
-      code: -32601,
-      message: 'Method not found'
-    },
-    id: message.id
-  };
-}
-
-// Routes
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-app.post('/mcp/:key', async (req, res) => {
-  const { key } = req.params;
-
-  if (key !== ODYS_KEY) {
-    log('Unauthorized MCP request with invalid key');
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  try {
-    const result = await handleMCPMessage(req.body);
-    res.json(result);
-  } catch (error) {
-    log('ERROR in /mcp handler:', error.message);
-    res.status(500).json({
-      jsonrpc: '2.0',
-      error: {
-        code: -32603,
-        message: error.message
-      },
-      id: req.body.id
-    });
+    const tool = body.method === 'tools/call' ? ' ' + (body.params && body.params.name) : '';
+    log('MCP', body.method + tool);
+    const r = await handle(env, body);
+    if (r && r.result && r.result.isError) log('Erreur outil :', r.result.content[0].text);
+    else if (r && r.result && r.result.structuredContent && r.result.structuredContent.number)
+      log('Devis créé :', r.result.structuredContent.number, '(id ' + r.result.structuredContent.id + ')');
+    return r ? res.json(r) : res.status(202).end();
+  } catch (e) {
+    log('ERREUR /mcp :', e && e.message);
+    return res.status(500).json(err(body.id ?? null, -32603, String(e && e.message || e)));
   }
 });
 
-app.get('/mcp/info', (req, res) => {
-  res.json({
-    service: 'Sellsy-Odys-MCP',
-    version: '1.0.0',
-    status: 'active'
-  });
-});
+// JSON mal formé
+app.use((e, req, res, next) => res.status(400).json(err(null, -32700, 'JSON invalide')));
 
-app.get('/', (req, res) => {
-  res.json({
-    service: 'Sellsy-Odys-MCP',
-    version: '1.0.0',
-    endpoints: [
-      'GET /health - Health check',
-      'POST /mcp/:key - MCP protocol',
-      'GET /mcp/info - Service info'
-    ]
-  });
-});
-
-// Start Server
 app.listen(PORT, () => {
-  log('='.repeat(60));
-  log('Sellsy-Odys-MCP Server Started');
-  log('='.repeat(60));
-  log('Port:', PORT);
-  log('Service URL:', `http://localhost:${PORT}`);
-  log('MCP Key configured:', ODYS_KEY ? 'YES' : 'NO');
-  log('Sellsy ID configured:', SELLSY_ID !== 'default-id' ? 'YES' : 'NO');
-  log('Sellsy Secret configured:', SELLSY_SECRET !== 'default-secret' ? 'YES' : 'NO');
-  log('OAuth2 Endpoint:', 'https://login.sellsy.com/oauth2/access-tokens');
-  log('='.repeat(60));
+  log('Serveur Sellsy-Odys-MCP ' + VERSION + ' démarré sur le port ' + PORT);
+  log('Sellsy : ' + (env.SELLSY_ID && env.SELLSY_SECRET ? 'identifiants présents' : 'IDENTIFIANTS MANQUANTS'));
+  if (!env.ODYS_KEY) log('ODYS_KEY MANQUANTE : toutes les requêtes /mcp seront refusées');
+  else if (env.ODYS_KEY.length < 24) log('ATTENTION : ODYS_KEY trop courte, utilisez au moins 24 caractères aléatoires');
 });
 
 export default app;
