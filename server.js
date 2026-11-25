@@ -7,6 +7,7 @@
  * Adresse du connecteur : https://<domaine>/mcp/<ODYS_KEY>
  */
 import express from 'express';
+import nodemailer from 'nodemailer';
 
 /*
  * Connecteur Sellsy d'Odys (ENERGETIK FRANCE) — Cloudflare Worker, serveur MCP (HTTP « streamable », réponses JSON).
@@ -18,7 +19,7 @@ import express from 'express';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -30,10 +31,25 @@ const TOOLS = [{
     properties: {
       job: {
         type: 'object',
-        description: "Demande de devis Odys : client {sellsyId, sellsyType, forceNew, societe, civilite, nom, prenom, email, tel, adresse, cp, ville}, rows [{sellsyId, ref, nom, qte, pu, tva} ou {type:'title', text}], date, subject, note, tvaDefaut.",
+        description: "Demande de devis Odys : client {sellsyId, sellsyType, forceNew, societe, civilite, nom, prenom, email, tel, adresse, cp, ville}, rows [{sellsyId, ref, nom, qte, pu, tva, fiche_technique} ou {type:'title', text}], date, subject, note, tvaDefaut, send_email (envoie le devis et les fiches techniques au client par e-mail).",
       },
     },
     required: ['job'],
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+}, {
+  name: 'send_estimate',
+  title: 'Envoyer un devis Sellsy par e-mail',
+  description: "Envoie au client un e-mail avec le lien du devis Sellsy et les liens des fiches techniques des articles.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      estimate_id: { type: 'number', description: 'ID Sellsy du devis' },
+      client_email: { type: 'string' },
+      client_name: { type: 'string' },
+      items: { type: 'array', description: 'Lignes [{nom, qte, pu, fiche_technique}]', items: { type: 'object' } },
+    },
+    required: ['estimate_id', 'client_email'],
   },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 }, {
@@ -138,6 +154,38 @@ class Sellsy {
   }
 }
 
+/* ---------- e-mail (fiches techniques) ---------- */
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const safeUrl = u => /^https?:\/\//i.test(String(u || '')) ? String(u) : null;
+let mailer = null;
+function getMailer(env) {
+  if (!env.SMTP_HOST || !env.SMTP_USER || !env.SMTP_PASS)
+    throw new Error("Envoi d'e-mail non configuré : ajoutez SMTP_HOST, SMTP_USER et SMTP_PASS dans les variables Railway");
+  if (!mailer) {
+    const port = Number(env.SMTP_PORT || 465);
+    mailer = nodemailer.createTransport({ host: env.SMTP_HOST, port, secure: port === 465, auth: { user: env.SMTP_USER, pass: env.SMTP_PASS } });
+  }
+  return mailer;
+}
+async function sendEstimateEmail(env, { to, name, est, items }) {
+  if (!to) throw new Error('Adresse e-mail du client absente');
+  const lines = (items || []).filter(r => r && r.type !== 'title').map(r => {
+    const fiche = safeUrl(r.fiche_technique || r.datasheet_url);
+    return `<tr><td>${esc(r.nom || r.description || 'Article')}</td><td style="text-align:center">${esc(r.qte ?? r.quantity ?? 1)}</td>` +
+      `<td>${fiche ? `<a href="${esc(fiche)}">Fiche technique</a>` : '—'}</td></tr>`;
+  }).join('');
+  const lien = safeUrl(est.public) || safeUrl(est.pdf);
+  const html = `<p>Bonjour${name ? ' ' + esc(name) : ''},</p>
+<p>Veuillez trouver votre devis <b>${esc(est.number || est.id)}</b>${est.subject ? ' (' + esc(est.subject) + ')' : ''}${lien ? ` : <a href="${esc(lien)}">consulter le devis</a>` : ''}.</p>
+${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse"><tr style="background:#f2f2f2"><th>Article</th><th>Qté</th><th>Fiche technique</th></tr>${lines}</table>` : ''}
+<p>Cordialement,<br><b>ENERGETIK FRANCE</b><br>02 40 45 79 33 · <a href="mailto:contact@energetikfrance.fr">contact@energetikfrance.fr</a></p>`;
+  const info = await getMailer(env).sendMail({
+    from: env.FROM_EMAIL || env.SMTP_USER, to,
+    subject: 'Votre devis ENERGETIK FRANCE ' + (est.number || ''), html,
+  });
+  return info.messageId;
+}
+
 function summary(e) {
   const a = e.amounts || {}, rel = (e.related || [])[0] || {}, pl = e.public_link;
   return {
@@ -193,7 +241,20 @@ async function handle(env, m) {
       try {
         if (name === 'create_estimate') {
           const s = await createEstimate(env, args.job);
+          if (args.job && args.job.send_email) {
+            try {
+              const c = args.job.client || {};
+              await sendEstimateEmail(env, { to: c.email, name: [c.prenom, c.nom].filter(Boolean).join(' ') || c.societe, est: s, items: args.job.rows });
+              s.emailEnvoye = true;
+            } catch (e) { s.emailEnvoye = false; s.emailErreur = String(e && e.message || e).slice(0, 300); }
+          }
           return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + s.number + ' créé dans Sellsy : ' + s.ttc.toFixed(2) + ' € TTC' }], structuredContent: s, isError: false });
+        }
+        if (name === 'send_estimate') {
+          const sy = new Sellsy(env);
+          const est = summary(await sy.call('GET', '/estimates/' + Number(args.estimate_id)));
+          const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items });
+          return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + args.client_email }], structuredContent: { ok: true, number: est.number, messageId: id }, isError: false });
         }
         if (name === 'ping') {
           const sy = new Sellsy(env); await sy.auth();
