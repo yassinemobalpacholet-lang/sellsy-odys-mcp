@@ -19,7 +19,7 @@ import nodemailer from 'nodemailer';
  *   ODYS_KEY       clé d'accès longue et aléatoire : l'adresse du connecteur est https://<worker>/mcp/<ODYS_KEY>
  */
 const API = 'https://api.sellsy.com/v2';
-const VERSION = '2.3.0';
+const VERSION = '2.4.0';
 const PROTO = '2025-06-18';
 
 const TOOLS = [{
@@ -48,6 +48,20 @@ const TOOLS = [{
       client_email: { type: 'string' },
       client_name: { type: 'string' },
       items: { type: 'array', description: 'Lignes [{nom, qte, pu, fiche_technique}]', items: { type: 'object' } },
+    },
+    required: ['estimate_id', 'client_email'],
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+}, {
+  name: 'send_relance',
+  title: 'Relancer le client sur son devis',
+  description: "Envoie au client l'e-mail de relance du devis (7 jours après l'envoi). Ne fait rien si le devis est déjà accepté, refusé, annulé ou facturé dans Sellsy.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      estimate_id: { type: 'number', description: 'ID Sellsy du devis' },
+      client_email: { type: 'string' },
+      client_name: { type: 'string', description: 'Civilité et nom, ex. « M. Dupont »' },
     },
     required: ['estimate_id', 'client_email'],
   },
@@ -214,6 +228,40 @@ ${lines ? `<table border="1" cellpadding="8" cellspacing="0" style="border-colla
   return info.messageId;
 }
 
+
+const FINAL_STATUS = ['accepted', 'refused', 'cancelled', 'advanced', 'invoiced', 'partialinvoiced'];
+const eurFr = v => Number(v || 0).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+async function sendRelanceEmail(env, { to, name, est }) {
+  if (!to) throw new Error('Adresse e-mail du client absente');
+  const lien = safeUrl(est.public) || safeUrl(est.pdf);
+  const html = `<p>Bonjour${name ? ' ' + esc(name) : ''},</p>
+<p>Il y a une semaine, nous vous avons transmis notre devis n° <b>${esc(est.number)}</b> d'un montant de <b>${esc(eurFr(est.ttc))} TTC</b>.</p>
+<p>Avez-vous pu en prendre connaissance ? Nous restons à votre disposition pour répondre à vos questions ou ajuster la proposition si besoin.</p>
+<p>N'hésitez pas à revenir vers nous pour nous tenir informés de l'avancement de votre projet, même si votre décision n'est pas encore prise.</p>
+${lien ? `<p>👉 <a href="${esc(lien)}"><b>Consulter et signer mon devis en ligne</b></a></p>` : ''}
+<p>Vous pouvez simplement répondre à cet e-mail ou nous appeler au <b>02 40 45 79 33</b>.</p>
+<p>Cordialement,<br><b>L'équipe ENERGETIK FRANCE</b><br>13 rue de la Dutée — 44800 Saint-Herblain<br>02 40 45 79 33 · <a href="mailto:contact@energetikfrance.fr">contact@energetikfrance.fr</a></p>`;
+  return sendMail(env, { to, name, subject: 'Votre devis ENERGETIK FRANCE n° ' + est.number, html });
+}
+async function sendMail(env, { to, name, subject, html }) {
+  const from = env.FROM_EMAIL || env.SMTP_USER || 'contact@energetikfrance.fr';
+  if (env.BREVO_API_KEY) {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 15000);
+    try {
+      const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', signal: ctl.signal,
+        headers: { 'api-key': env.BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ sender: { name: env.FROM_NAME || 'ENERGETIK FRANCE', email: from }, replyTo: { email: from, name: 'ENERGETIK FRANCE' }, to: [{ email: to, name: name || undefined }], subject, htmlContent: html }),
+      });
+      const txt = await r.text();
+      if (!r.ok) throw new Error('Brevo ' + r.status + ' : ' + txt.slice(0, 300));
+      return (JSON.parse(txt || '{}').messageId) || 'brevo';
+    } finally { clearTimeout(t); }
+  }
+  const info = await getMailer(env).sendMail({ from, to, subject, html });
+  return info.messageId;
+}
+
 function summary(e) {
   const a = e.amounts || {}, rel = (e.related || [])[0] || {}, pl = e.public_link;
   return {
@@ -283,6 +331,14 @@ async function handle(env, m) {
           const est = summary(await sy.call('GET', '/estimates/' + Number(args.estimate_id)));
           const id = await sendEstimateEmail(env, { to: args.client_email, name: args.client_name, est, items: args.items });
           return ok(m.id, { content: [{ type: 'text', text: 'Devis ' + est.number + ' envoyé à ' + args.client_email }], structuredContent: { ok: true, number: est.number, messageId: id }, isError: false });
+        }
+        if (name === 'send_relance') {
+          const est = summary(await new Sellsy(env).call('GET', '/estimates/' + Number(args.estimate_id)));
+          if (FINAL_STATUS.includes(est.status)) {
+            return ok(m.id, { content: [{ type: 'text', text: 'Pas de relance : devis ' + est.number + ' au statut ' + est.status }], structuredContent: { ok: true, skipped: true, status: est.status, number: est.number }, isError: false });
+          }
+          const id = await sendRelanceEmail(env, { to: args.client_email, name: args.client_name, est });
+          return ok(m.id, { content: [{ type: 'text', text: 'Relance du devis ' + est.number + ' envoyée à ' + args.client_email }], structuredContent: { ok: true, skipped: false, status: est.status, number: est.number, messageId: id }, isError: false });
         }
         if (name === 'catalog_api') {
           const meth = String(args.method || 'GET').toUpperCase(), path = String(args.path || '');
